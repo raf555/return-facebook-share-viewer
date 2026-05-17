@@ -1,0 +1,946 @@
+// FB Share Revealer — content script
+// Scope: runs only on the logged-in user's own profile page.
+// For each post on that page with shares > 0, injects a "N shares" link.
+// Hover → tooltip with first sharers. Click → modal with all visible sharers.
+
+window.__fbsrReport = window.__fbsrReport || [];
+
+// =============================================================
+// PFBID NETWORK INTERCEPT (runs at document_start, before FB code)
+// Patches XMLHttpRequest to read /api/graphql/ responses, extracts
+// reshare pfbids and indexes them by post_id, attached media id, and
+// attached_story.post_id. Later, getPostPfbid() falls back to this map
+// for posts whose pfbid hasn't been hydrated into the DOM yet.
+// =============================================================
+(function installPfbidIntercept() {
+  if (window.__fbsrPfbidMap) return; // already installed
+  const pfbidMap = new Map();
+  window.__fbsrPfbidMap = pfbidMap;
+
+  function indexResponseForPfbids(obj) {
+    if (!obj || typeof obj !== 'object') return;
+    if (typeof obj.post_id === 'string' && typeof obj.wwwURL === 'string' && obj.wwwURL.indexOf('pfbid') !== -1) {
+      const m = obj.wwwURL.match(/pfbid[A-Za-z0-9]+/);
+      if (m) {
+        const pfbid = m[0];
+        pfbidMap.set(obj.post_id, pfbid);
+        if (Array.isArray(obj.attachments)) {
+          for (const att of obj.attachments) {
+            if (!att) continue;
+            // Photos and most other media use media.id.
+            if (att.media && att.media.id) pfbidMap.set(att.media.id, pfbid);
+            // Reels and video reshares expose their numeric id under target.id
+            // (and the DOM uses this value in the /reel/<id>/ permalink).
+            if (att.target && att.target.id) pfbidMap.set(att.target.id, pfbid);
+          }
+        }
+        if (obj.attached_story && obj.attached_story.post_id) {
+          pfbidMap.set(obj.attached_story.post_id, pfbid);
+        }
+      }
+    }
+    for (const k in obj) {
+      const v = obj[k];
+      if (v && typeof v === 'object') indexResponseForPfbids(v);
+    }
+  }
+
+  function processBody(text) {
+    if (!text || text.indexOf('pfbid') === -1) return;
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try { indexResponseForPfbids(JSON.parse(line)); } catch (e) { /* ignore */ }
+    }
+  }
+
+  try {
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__fbsrUrl = url;
+      return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      const xhr = this;
+      if (xhr.__fbsrUrl && String(xhr.__fbsrUrl).indexOf('/api/graphql') !== -1) {
+        xhr.addEventListener('load', function () {
+          if (xhr.status === 200 && xhr.responseText) {
+            try { processBody(xhr.responseText); } catch (e) { /* ignore */ }
+          }
+        });
+      }
+      return origSend.apply(this, arguments);
+    };
+    console.log('[FBSR] pfbid intercept installed (XHR)');
+  } catch (e) {
+    console.warn('[FBSR] pfbid intercept failed:', e);
+  }
+})();
+
+function fbsrMain() {
+  'use strict';
+
+  // ============================================================
+  // Debug logging
+  // ============================================================
+  const DEBUG = true;
+  const LOG_PREFIX = '[FBSR]';
+
+  function log(...args) {
+    if (DEBUG) console.log(LOG_PREFIX, ...args);
+  }
+  function warn(...args) {
+    if (DEBUG) console.warn(LOG_PREFIX, ...args);
+  }
+  function err(...args) {
+    if (DEBUG) console.error(LOG_PREFIX, ...args);
+  }
+  function group(label, fn) {
+    if (!DEBUG) return fn();
+    console.groupCollapsed(LOG_PREFIX + ' ' + label);
+    try {
+      return fn();
+    } finally {
+      console.groupEnd();
+    }
+  }
+
+  log('script loaded at', new Date().toISOString(), '| url:', location.href);
+
+  // ============================================================
+  // Token scraping
+  // ============================================================
+
+  function scrapeTokens() {
+    const html = document.documentElement.innerHTML;
+    const fbDtsg =
+      html.match(/"DTSGInitData",\[\],\{"token":"([^"]+)"/)?.[1] ||
+      html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/)?.[1] ||
+      html.match(/name="fb_dtsg" value="([^"]+)"/)?.[1];
+    const lsd = html.match(/"LSD",\[\],\{"token":"([^"]+)"/)?.[1];
+    const userId = document.cookie.match(/c_user=(\d+)/)?.[1];
+
+    log('scrapeTokens:', {
+      fbDtsg: fbDtsg ? `${fbDtsg.slice(0, 6)}…(${fbDtsg.length} chars)` : null,
+      lsd: lsd ? `${lsd.slice(0, 6)}…` : null,
+      userId,
+    });
+
+    if (!fbDtsg || !userId) return null;
+    const jazoest = '2' + [...fbDtsg].reduce((s, c) => s + c.charCodeAt(0), 0);
+    return { fbDtsg, lsd: lsd || '', userId, jazoest };
+  }
+
+  let tokens = scrapeTokens();
+  if (!tokens) {
+    err('Failed to scrape tokens. Are you logged in?');
+    return;
+  }
+
+  // ============================================================
+  // Profile-page detection
+  // ============================================================
+
+  let cachedSlug = null;
+
+  function getOwnSlug() {
+    if (cachedSlug) {
+      log('getOwnSlug: using cached slug:', cachedSlug);
+      return cachedSlug;
+    }
+
+    return group('getOwnSlug — scanning for slug', () => {
+      // Strategy 1: anchors that include profile.php?id=<userId>
+      const numericAnchors = document.querySelectorAll(
+        `a[href*="profile.php?id=${tokens.userId}"]`
+      );
+      log(`Strategy 1: found ${numericAnchors.length} numeric-id anchors`);
+
+      // Strategy 2: if the URL slug matches the (sole or any) "vanity" field in HTML, it's ours
+      const html = document.documentElement.innerHTML;
+      const vanities = [...html.matchAll(/"vanity":"([^"]+)"/g)].map(m => m[1]);
+      log(`Strategy 2: found ${vanities.length} vanity field(s) in HTML:`, vanities);
+      const urlSlugMatch = location.pathname.match(/^\/([^\/\?#]+)(?:\/|$)/);
+      const urlSlug = urlSlugMatch && urlSlugMatch[1] !== 'profile.php' ? urlSlugMatch[1] : null;
+      if (urlSlug && vanities.includes(urlSlug)) {
+        log('Strategy 2: URL slug matches a vanity in HTML →', urlSlug);
+        cachedSlug = urlSlug;
+        return cachedSlug;
+      }
+
+      // Strategy 3: scan labeled anchors for "Your profile" type aria
+      const labeledAnchors = [...document.querySelectorAll('a[aria-label][href]')];
+      log(`Strategy 3: scanning ${labeledAnchors.length} labeled anchors`);
+      for (const a of labeledAnchors) {
+        const aria = (a.getAttribute('aria-label') || '').toLowerCase();
+        const href = a.getAttribute('href') || '';
+        if (aria.includes('your profile')) {
+          const m = href.match(/^\/([^\/\?#]+)(?:\/|\?|$)/);
+          if (m && m[1] !== 'profile.php') {
+            log('Strategy 3: matched aria "your profile" →', m[1]);
+            cachedSlug = m[1];
+            return cachedSlug;
+          }
+        }
+      }
+
+      // Strategy 4: "Edit profile" button visible → URL slug is ours
+      const editProfileBtn = [
+        ...document.querySelectorAll('div[role="button"], a[role="button"]'),
+      ].find(
+        (b) =>
+          /edit profile/i.test(b.textContent || '') ||
+          /edit profile/i.test(b.getAttribute('aria-label') || '')
+      );
+      if (editProfileBtn) {
+        const m = location.pathname.match(/^\/([^\/\?#]+)(?:\/|$)/);
+        if (m && m[1] !== 'profile.php') {
+          log('Strategy 4: "Edit profile" button present → URL slug is ours:', m[1]);
+          cachedSlug = m[1];
+          return cachedSlug;
+        }
+      } else {
+        log('Strategy 4: no "Edit profile" button visible');
+      }
+
+      warn('getOwnSlug: ALL strategies failed');
+      return null;
+    });
+  }
+
+  function isOnOwnProfile() {
+    const path = location.pathname;
+    const search = location.search;
+
+    const idMatch = search.match(/[?&]id=(\d+)/);
+    if (path === '/profile.php' && idMatch && idMatch[1] === tokens.userId) {
+      log('isOnOwnProfile: TRUE (profile.php?id=', tokens.userId, ')');
+      return true;
+    }
+
+    const slug = getOwnSlug();
+    if (!slug) {
+      log('isOnOwnProfile: FALSE (no slug determined)');
+      return false;
+    }
+    const m = path.match(/^\/([^\/]+)(?:\/|$)/);
+    if (!m) {
+      log('isOnOwnProfile: FALSE (path does not look like profile path):', path);
+      return false;
+    }
+    const result = m[1].toLowerCase() === slug.toLowerCase();
+    log(`isOnOwnProfile: ${result ? 'TRUE' : 'FALSE'} (path slug "${m[1]}" vs own "${slug}")`);
+    return result;
+  }
+
+  // ============================================================
+  // GraphQL client
+  // ============================================================
+
+  async function callGraphQL({ friendlyName, docId, variables }) {
+    if (!tokens) tokens = scrapeTokens();
+    if (!tokens) throw new Error('No tokens');
+
+    log(`GraphQL → ${friendlyName}`, { variables });
+
+    const body = new URLSearchParams({
+      av: tokens.userId,
+      __user: tokens.userId,
+      __a: '1',
+      __req: '1',
+      fb_dtsg: tokens.fbDtsg,
+      jazoest: tokens.jazoest,
+      lsd: tokens.lsd,
+      fb_api_caller_class: 'RelayModern',
+      fb_api_req_friendly_name: friendlyName,
+      server_timestamps: 'true',
+      variables: JSON.stringify(variables),
+      doc_id: docId,
+    });
+
+    const res = await fetch('https://www.facebook.com/api/graphql/', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'x-fb-friendly-name': friendlyName,
+        'x-fb-lsd': tokens.lsd,
+      },
+      body: body.toString(),
+    });
+    const text = await res.text();
+    const firstChunk = text.replace(/^for \(;;\);/, '').split('\n')[0];
+    const parsed = JSON.parse(firstChunk);
+    log(`GraphQL ← ${friendlyName}`, parsed.errors ? { errors: parsed.errors } : 'ok');
+    return parsed;
+  }
+
+  function tooltipQuery(pfbid) {
+    return callGraphQL({
+      friendlyName: 'CometUFISharesCountTooltipContentQuery',
+      docId: '9843821265734688',
+      variables: { feedbackTargetID: pfbid },
+    });
+  }
+
+  // Initial page: fetch first batch of sharers + the feedback base64 id we
+  // need for subsequent paginated requests.
+  function dialogQuery(pfbid, count = 10) {
+    return callGraphQL({
+      friendlyName: 'CometResharesDialogQuery',
+      docId: '26194058653607577',
+      variables: {
+        count,
+        feedbackID: pfbid,
+        feedbackSource: 1,
+        feedLocation: 'SHARE_OVERLAY',
+        privacySelectorRenderLocation: 'COMET_STREAM',
+        renderLocation: 'reshares_dialog',
+        scale: 1,
+        __relay_internal__pv__CometFeedStory_enable_reactor_facepilerelayprovider: false,
+        __relay_internal__pv__CometFeedStory_enable_post_permalink_white_space_clickrelayprovider: false,
+        __relay_internal__pv__CometUFICommentActionLinksRewriteEnabledrelayprovider: false,
+        __relay_internal__pv__CometUFICommentAvatarStickerAnimatedImagerelayprovider: false,
+        __relay_internal__pv__IsWorkUserrelayprovider: false,
+        __relay_internal__pv__GHLShouldChangeSponsoredDataFieldNamerelayprovider: true,
+        __relay_internal__pv__TestPilotShouldIncludeDemoAdUseCaserelayprovider: false,
+        __relay_internal__pv__FBReels_deprecate_short_form_video_context_gkrelayprovider: true,
+        __relay_internal__pv__GHLShouldChangeAdIdFieldNamerelayprovider: true,
+        __relay_internal__pv__FBReels_enable_view_dubbed_audio_type_gkrelayprovider: true,
+        __relay_internal__pv__CometFeedShareMedia_shouldPrefetchShareImagerelayprovider: false,
+        __relay_internal__pv__CometImmersivePhotoCanUserDisable3DMotionrelayprovider: false,
+        __relay_internal__pv__WorkCometIsEmployeeGKProviderrelayprovider: false,
+        __relay_internal__pv__IsMergQAPollsrelayprovider: false,
+        __relay_internal__pv__FBReelsMediaFooter_comet_enable_reels_ads_gkrelayprovider: true,
+        __relay_internal__pv__CometUFIReactionsEnableShortNamerelayprovider: false,
+        __relay_internal__pv__CometUFICommentAutoTranslationTyperelayprovider: 'ORIGINAL',
+        __relay_internal__pv__CometUFIShareActionMigrationrelayprovider: true,
+        __relay_internal__pv__CometUFISingleLineUFIrelayprovider: true,
+        __relay_internal__pv__relay_provider_comet_ufi_ssr_seo_deferrelayprovider: true,
+        __relay_internal__pv__CometUFI_dedicated_comment_routable_dialog_gkrelayprovider: true,
+      },
+    });
+  }
+
+  // Subsequent pages: take the base64 feedback `id` from the first response
+  // and a `cursor`. Returns more reshare edges under data.node.reshares.
+  function paginationQuery(feedbackBase64Id, cursor, count = 10) {
+    return callGraphQL({
+      friendlyName: 'CometResharesFeedPaginationQuery',
+      docId: '36071431812455144',
+      variables: {
+        count,
+        cursor,
+        feedLocation: 'SHARE_OVERLAY',
+        feedbackSource: 1,
+        focusCommentID: null,
+        privacySelectorRenderLocation: 'COMET_STREAM',
+        referringStoryRenderLocation: null,
+        renderLocation: 'reshares_dialog',
+        scale: 1,
+        useDefaultActor: false,
+        id: feedbackBase64Id,
+        __relay_internal__pv__CometFeedStory_enable_reactor_facepilerelayprovider: false,
+        __relay_internal__pv__CometFeedStory_enable_post_permalink_white_space_clickrelayprovider: false,
+        __relay_internal__pv__CometUFICommentActionLinksRewriteEnabledrelayprovider: false,
+        __relay_internal__pv__CometUFICommentAvatarStickerAnimatedImagerelayprovider: false,
+        __relay_internal__pv__IsWorkUserrelayprovider: false,
+        __relay_internal__pv__GHLShouldChangeSponsoredDataFieldNamerelayprovider: true,
+        __relay_internal__pv__TestPilotShouldIncludeDemoAdUseCaserelayprovider: false,
+        __relay_internal__pv__FBReels_deprecate_short_form_video_context_gkrelayprovider: true,
+        __relay_internal__pv__GHLShouldChangeAdIdFieldNamerelayprovider: true,
+        __relay_internal__pv__FBReels_enable_view_dubbed_audio_type_gkrelayprovider: true,
+        __relay_internal__pv__CometFeedShareMedia_shouldPrefetchShareImagerelayprovider: false,
+        __relay_internal__pv__CometImmersivePhotoCanUserDisable3DMotionrelayprovider: false,
+        __relay_internal__pv__WorkCometIsEmployeeGKProviderrelayprovider: false,
+        __relay_internal__pv__IsMergQAPollsrelayprovider: false,
+        __relay_internal__pv__FBReelsMediaFooter_comet_enable_reels_ads_gkrelayprovider: true,
+        __relay_internal__pv__CometUFIReactionsEnableShortNamerelayprovider: false,
+        __relay_internal__pv__CometUFICommentAutoTranslationTyperelayprovider: 'ORIGINAL',
+        __relay_internal__pv__CometUFIShareActionMigrationrelayprovider: true,
+        __relay_internal__pv__CometUFISingleLineUFIrelayprovider: true,
+        __relay_internal__pv__relay_provider_comet_ufi_ssr_seo_deferrelayprovider: true,
+        __relay_internal__pv__CometUFI_dedicated_comment_routable_dialog_gkrelayprovider: true,
+      },
+    });
+  }
+
+  // ============================================================
+  // Post discovery
+  // ============================================================
+
+  function getPostPfbid(article) {
+    const aria = article.getAttribute('aria-label') || '';
+    if (/^(Comment|Reply) by/i.test(aria)) {
+      log('skipping article (comment/reply):', aria.slice(0, 60));
+      return null;
+    }
+    const html = article.outerHTML;
+    // 1. DOM scrape (works when FB has hydrated the timestamp link).
+    const m = html.match(/pfbid[A-Za-z0-9]+/);
+    if (m) {
+      log('found pfbid via DOM:', m[0].slice(0, 20) + '…');
+      return m[0];
+    }
+    // 2. Fallback: consult the network-intercept map. Try every long
+    //    numeric ID we can pull out of the container. The map is keyed by
+    //    post_id, attachment.media.id, and attached_story.post_id.
+    const map = window.__fbsrPfbidMap;
+    if (map && map.size) {
+      const ids = new Set(html.match(/\b\d{14,20}\b/g) || []);
+      for (const id of ids) {
+        const pfbid = map.get(id);
+        if (pfbid) {
+          log(`found pfbid via map: id=${id} -> ${pfbid.slice(0, 20)}…`);
+          return pfbid;
+        }
+      }
+      log(`no pfbid in DOM; tried ${ids.size} ids against map (size ${map.size}), no match`);
+    } else {
+      log('no pfbid found in article, map empty');
+    }
+    return null;
+  }
+
+  // ============================================================
+  // Link injection
+  // ============================================================
+
+  const processed = new WeakSet();
+  let postCounter = 0;
+
+  const retryScheduled = new WeakSet();
+
+  function setupPfbidRetry(article, postIdx) {
+    if (retryScheduled.has(article)) return;
+    retryScheduled.add(article);
+
+    const io = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        log(`retry #${postIdx}: post in viewport, waiting 1500ms for hydration`);
+        io.disconnect();
+        setTimeout(() => {
+          log(`retry #${postIdx}: re-running processPost`);
+          processPost(article);
+        }, 1500);
+        break;
+      }
+    }, { threshold: 0.3 });
+
+    io.observe(article);
+  }
+
+  async function processPost(article) {
+    if (processed.has(article)) return;
+    processed.add(article);
+    const postIdx = ++postCounter;
+    const rect = article.getBoundingClientRect();
+    const messageEl = article.querySelector('[data-ad-rendering-role="story_message"], [data-ad-preview="message"]');
+    const messagePreview = messageEl ? messageEl.textContent.slice(0, 60).replace(/\s+/g, ' ') : '(no message el)';
+    log(`processPost #${postIdx}: starting`);
+    log(`  container tag=${article.tagName} class="${article.className.slice(0, 60)}..."`);
+    log(`  rect: top=${Math.round(rect.top)} left=${Math.round(rect.left)} w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+    log(`  message preview: "${messagePreview}"`);
+
+    let pfbid = getPostPfbid(article);
+    if (!pfbid) {
+      log(`processPost #${postIdx}: no pfbid on first pass, setting up viewport retry`);
+      processed.delete(article);
+      setupPfbidRetry(article, postIdx);
+      return;
+    }
+
+    let data;
+    try {
+      data = await tooltipQuery(pfbid);
+    } catch (e) {
+      err(`processPost #${postIdx}: tooltip query threw`, e);
+      return;
+    }
+    const count = data?.data?.feedback?.reshares?.count;
+    const feedbackId = data?.data?.feedback?.id;
+    log(`processPost #${postIdx}: SHARE COUNT REPORT`);
+    log(`  pfbid: ${pfbid}`);
+    log(`  feedbackId: ${feedbackId}`);
+    log(`  count: ${count}`);
+    log(`  message: "${messagePreview}"`);
+    window.__fbsrReport.push({ postIdx, pfbid, count, message: messagePreview });
+    if (!count || count <= 0) {
+      log(`processPost #${postIdx}: count is zero, skipping injection`);
+      return;
+    }
+    log(`processPost #${postIdx}: count > 0, proceeding to inject`);
+
+    injectLink(article, pfbid, count, data.data.feedback.legacy_resharers || [], postIdx);
+  }
+
+  function injectLink(article, pfbid, count, initialResharers, postIdx) {
+    if (article.querySelector('.fbsr-link-container')) {
+      log(`injectLink #${postIdx}: container already exists, skipping`);
+      return;
+    }
+
+    log(`injectLink #${postIdx}: injecting "${count} share${count !== 1 ? 's' : ''}" link`);
+
+    const container = document.createElement('div');
+    container.className = 'fbsr-link-container';
+
+    const link = document.createElement('a');
+    link.className = 'fbsr-link';
+    link.href = '#';
+    link.textContent = count === 1 ? '1 share' : `${count} shares`;
+    // DEBUG: temporary inline styles to make link unmissable
+    link.style.cssText = 'display:inline-block !important; padding:6px 12px !important; background:#ff00ff !important; color:#fff !important; font-weight:bold !important; border:2px solid #000 !important; border-radius:4px !important; margin:8px !important; text-decoration:none !important; z-index:9999 !important;';
+    container.style.cssText = 'display:block !important; padding:4px !important; background:rgba(255,255,0,0.3) !important;';
+
+    let tooltipEl = null;
+    let hoverTimer = null;
+    let tooltipData = initialResharers;
+
+    function showTooltip() {
+      if (tooltipEl) return;
+      log(`tooltip #${postIdx}: showing`);
+      tooltipEl = document.createElement('div');
+      tooltipEl.className = 'fbsr-tooltip';
+      renderTooltipContent(tooltipEl, tooltipData, count);
+      document.body.appendChild(tooltipEl);
+      positionTooltip(tooltipEl, link);
+    }
+
+    function hideTooltip() {
+      if (tooltipEl) {
+        log(`tooltip #${postIdx}: hiding`);
+        tooltipEl.remove();
+        tooltipEl = null;
+      }
+    }
+
+    link.addEventListener('mouseenter', () => {
+      clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(showTooltip, 300);
+    });
+    link.addEventListener('mouseleave', () => {
+      clearTimeout(hoverTimer);
+      hideTooltip();
+    });
+
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      log(`link #${postIdx}: clicked, opening modal`);
+      hideTooltip();
+      openModal(pfbid, count);
+    });
+
+    container.appendChild(link);
+    placeContainer(article, container, postIdx);
+  }
+
+  function renderTooltipContent(el, resharers, count) {
+    el.innerHTML = '';
+    if (!resharers || resharers.length === 0) {
+      const s = document.createElement('span');
+      s.className = 'fbsr-tooltip-loading';
+      s.textContent = count > 0 ? 'No visible sharers' : 'No shares';
+      el.appendChild(s);
+      return;
+    }
+    for (const r of resharers) {
+      const n = document.createElement('span');
+      n.className = 'fbsr-tooltip-name';
+      n.textContent = r.name;
+      el.appendChild(n);
+    }
+    if (resharers.length < count) {
+      const more = document.createElement('span');
+      more.className = 'fbsr-tooltip-name';
+      more.style.color = '#65676b';
+      more.textContent = `and ${count - resharers.length} more`;
+      el.appendChild(more);
+    }
+  }
+
+  function positionTooltip(tooltipEl, anchor) {
+    const r = anchor.getBoundingClientRect();
+    const t = tooltipEl.getBoundingClientRect();
+    let top = window.scrollY + r.bottom + 6;
+    let left = window.scrollX + r.left;
+    if (left + t.width > window.scrollX + window.innerWidth - 8) {
+      left = window.scrollX + window.innerWidth - t.width - 8;
+    }
+    tooltipEl.style.top = `${top}px`;
+    tooltipEl.style.left = `${left}px`;
+  }
+
+  // ============================================================
+  // Container placement
+  // ============================================================
+
+  function placeContainer(article, container, postIdx) {
+    const shareBtn = article.querySelector('[data-ad-rendering-role="share_button"]');
+    if (!shareBtn) {
+      warn(`placeContainer #${postIdx}: no share button`);
+      article.appendChild(container);
+      return;
+    }
+
+    // Walk up to find the action row (smallest ancestor with all 3 action buttons, no composer).
+    let actionRow = shareBtn;
+    for (let i = 0; i < 10 && actionRow; i++) {
+      actionRow = actionRow.parentElement;
+      if (!actionRow || actionRow === article) break;
+      const hasLike = !!actionRow.querySelector('[aria-label="Like"]');
+      const hasComment = !!actionRow.querySelector('[aria-label="Leave a comment"]');
+      const hasShare = !!actionRow.querySelector('[data-ad-rendering-role="share_button"]');
+      const hasEditable = !!actionRow.querySelector('[contenteditable="true"]');
+      if (hasLike && hasComment && hasShare && !hasEditable) {
+        // Insert as the LAST child of the action row, so the flex layout
+        // places our link inline with the like/comment/share buttons.
+        actionRow.appendChild(container);
+        const rect = container.getBoundingClientRect();
+        log(`placeContainer #${postIdx}: appended into action row at depth ${i + 1}, rect: top=${Math.round(rect.top)} left=${Math.round(rect.left)} w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+        return;
+      }
+    }
+    warn(`placeContainer #${postIdx}: walk failed, appending to article`);
+    article.appendChild(container);
+  }
+
+  // ============================================================
+  // Modal
+  // ============================================================
+
+  function openModal(pfbid, count) {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'fbsr-modal-backdrop';
+
+    const modal = document.createElement('div');
+    modal.className = 'fbsr-modal';
+
+    const header = document.createElement('div');
+    header.className = 'fbsr-modal-header';
+    const title = document.createElement('span');
+    title.textContent = count === 1 ? 'Shared by 1 person' : `Shared by ${count} people`;
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'fbsr-modal-close';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', 'Close');
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+
+    const body = document.createElement('div');
+    body.className = 'fbsr-modal-body';
+    const status = document.createElement('div');
+    status.className = 'fbsr-modal-status';
+    status.textContent = 'Loading…';
+    body.appendChild(status);
+
+    modal.appendChild(header);
+    modal.appendChild(body);
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+
+    function close() {
+      log('modal: closing');
+      backdrop.remove();
+      document.removeEventListener('keydown', onKey);
+    }
+    function onKey(e) {
+      if (e.key === 'Escape') close();
+    }
+    closeBtn.addEventListener('click', close);
+    backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) close();
+    });
+    document.addEventListener('keydown', onKey);
+
+    // Paginated fetch: load first page, then auto-fetch more when the user
+    // scrolls to the bottom of the modal body. Stop when has_next_page is false.
+    const renderedIds = new Set(); // dedupe by edge.node.id
+    let nextCursor = null;
+    let hasMore = true;
+    let loading = false;
+    let totalRendered = 0;
+
+    function renderEdges(edges) {
+      for (const edge of edges) {
+        const id = edge?.node?.id;
+        if (id && renderedIds.has(id)) continue;
+        if (id) renderedIds.add(id);
+        const row = buildSharerRow(edge);
+        if (row) {
+          body.appendChild(row);
+          totalRendered++;
+        }
+      }
+    }
+
+    function showStatus(text) {
+      const s = document.createElement('div');
+      s.className = 'fbsr-modal-status';
+      s.textContent = text;
+      body.appendChild(s);
+      return s;
+    }
+
+    let sentinel = null;
+    let io = null;
+
+    // After the first page we'll need the feedback's base64 id (different
+    // from the pfbid) to drive the pagination query.
+    let feedbackBase64Id = null;
+    let firstPageLoaded = false;
+
+    async function loadMore() {
+      if (loading || !hasMore) return;
+      loading = true;
+      const loadingEl = sentinel ? null : showStatus('Loading sharers…');
+      try {
+        const prevCursor = nextCursor;
+        let reshares;
+        if (!firstPageLoaded) {
+          const data = await dialogQuery(pfbid, 10);
+          feedbackBase64Id = data?.data?.feedback?.id || null;
+          reshares = data?.data?.feedback?.reshares;
+          firstPageLoaded = true;
+        } else {
+          if (!feedbackBase64Id || !nextCursor) {
+            hasMore = false;
+          } else {
+            const data = await paginationQuery(feedbackBase64Id, nextCursor, 10);
+            // Pagination response wraps the connection under `node`.
+            reshares = data?.data?.node?.reshares || data?.data?.feedback?.reshares;
+          }
+        }
+
+        const edges = reshares?.edges || [];
+        const pageInfo = reshares?.page_info || reshares?.pageInfo || {};
+        nextCursor = pageInfo.end_cursor || pageInfo.endCursor || null;
+        const cursorAdvanced = nextCursor && nextCursor !== prevCursor;
+        const reportedHasNext = pageInfo.has_next_page !== undefined ? pageInfo.has_next_page : pageInfo.hasNextPage;
+        hasMore = edges.length > 0 && cursorAdvanced && reportedHasNext !== false;
+        log(`modal: page returned ${edges.length} edges, hasMore=${hasMore}, feedbackId=${feedbackBase64Id ? feedbackBase64Id.slice(0, 12) + '…' : 'none'}, cursor=${nextCursor ? String(nextCursor).slice(0, 12) + '…' : 'none'}`);
+
+        if (loadingEl) loadingEl.remove();
+        if (sentinel) { sentinel.remove(); sentinel = null; }
+
+        renderEdges(edges);
+
+        if (totalRendered === 0 && !hasMore) {
+          showStatus(count > 0 ? 'No visible sharers (some may be private).' : 'No one has shared this post.');
+          return;
+        }
+        if (totalRendered < count && !hasMore) {
+          const hidden = count - totalRendered;
+          showStatus(`${hidden} sharer${hidden === 1 ? '' : 's'} hidden by privacy settings.`);
+          return;
+        }
+        if (hasMore) {
+          sentinel = document.createElement('div');
+          sentinel.className = 'fbsr-modal-status';
+          sentinel.textContent = 'Loading more…';
+          body.appendChild(sentinel);
+          if (!io) {
+            io = new IntersectionObserver((entries) => {
+              for (const e of entries) {
+                if (e.isIntersecting) loadMore();
+              }
+            }, { root: body, threshold: 0.1 });
+          }
+          io.observe(sentinel);
+        }
+      } catch (e) {
+        err('modal: page query failed', e);
+        if (loadingEl) loadingEl.remove();
+        if (sentinel) { sentinel.remove(); sentinel = null; }
+        showStatus('Failed to load sharers.');
+      } finally {
+        loading = false;
+      }
+    }
+
+    // Cleanup observer when modal closes. We rely on the original `close`
+    // function (declared above) — we just intercept it to also disconnect
+    // the IntersectionObserver. Wrap by overriding the global function via
+    // a flag check instead of reassignment (function declarations can't be
+    // reassigned in strict mode reliably across scopes).
+    const origRemove = backdrop.remove.bind(backdrop);
+    backdrop.remove = function () {
+      if (io) { io.disconnect(); io = null; }
+      origRemove();
+    };
+
+    // Clear the initial "Loading…" status that the outer code put in body.
+    body.innerHTML = '';
+
+    loadMore();
+  }
+
+  function buildSharerRow(edge) {
+    const node = edge.node;
+    const shareStory = node?.comet_sections?.context_layout?.story;
+    if (!shareStory) {
+      warn('buildSharerRow: missing context_layout.story');
+      return null;
+    }
+    const actor = shareStory.comet_sections?.actor_photo?.story?.actors?.[0];
+    if (!actor) {
+      warn('buildSharerRow: missing actor');
+      return null;
+    }
+
+    let creationTime = null;
+    let privacy = null;
+    for (const m of shareStory.comet_sections?.metadata || []) {
+      const tn = m.__typename;
+      if (tn === 'CometFeedStoryLongerTimestampStrategy' && m.story?.creation_time) {
+        creationTime = m.story.creation_time;
+      } else if (tn === 'CometFeedStoryAudienceStrategy') {
+        privacy = m.story?.privacy_scope?.description;
+      }
+    }
+
+    const captionText =
+      node?.comet_sections?.content?.story?.comet_sections?.message?.story?.message?.text;
+
+    const a = document.createElement('a');
+    a.className = 'fbsr-sharer-row';
+    a.href = node.permalink_url || actor.profile_url || '#';
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+
+    const img = document.createElement('img');
+    img.className = 'fbsr-sharer-avatar';
+    img.src = actor.profile_picture?.uri || '';
+    img.alt = '';
+    img.referrerPolicy = 'no-referrer';
+
+    const info = document.createElement('div');
+    info.className = 'fbsr-sharer-info';
+
+    const name = document.createElement('div');
+    name.className = 'fbsr-sharer-name';
+    name.textContent = actor.name;
+    info.appendChild(name);
+
+    const metaBits = [];
+    if (creationTime) metaBits.push(formatRelativeTime(creationTime));
+    if (privacy) metaBits.push(privacy);
+    if (metaBits.length) {
+      const meta = document.createElement('div');
+      meta.className = 'fbsr-sharer-meta';
+      meta.textContent = metaBits.join(' · ');
+      info.appendChild(meta);
+    }
+
+    if (captionText) {
+      const caption = document.createElement('div');
+      caption.className = 'fbsr-sharer-caption';
+      caption.textContent = captionText;
+      info.appendChild(caption);
+    }
+
+    a.appendChild(img);
+    a.appendChild(info);
+    return a;
+  }
+
+  function formatRelativeTime(unix) {
+    const diff = Date.now() / 1000 - unix;
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+    if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d`;
+    return new Date(unix * 1000).toLocaleDateString();
+  }
+
+  // ============================================================
+  // Observer
+  // ============================================================
+
+  function findPostContainers(root = document) {
+    // A post is identifiable by having a share_button + comment_button.
+    // The post container is the nearest ancestor that contains the message and the action row.
+    const shareButtons = root.querySelectorAll('[data-ad-rendering-role="share_button"]');
+    const containers = new Set();
+    shareButtons.forEach(sb => {
+      // Walk up until we find an element that ALSO contains a story_message
+      let el = sb;
+      for (let i = 0; i < 15 && el; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        if (el.querySelector('[data-ad-rendering-role="story_message"]') ||
+          el.querySelector('[data-ad-preview="message"]') ||
+          el.querySelector('[aria-label^="Actions for this post"]')) {
+          containers.add(el);
+          break;
+        }
+      }
+    });
+    return [...containers];
+  }
+
+  function scanExistingPosts() {
+    const onProfile = isOnOwnProfile();
+    if (!onProfile) {
+      log('scanExistingPosts: not on own profile, skipping scan');
+      return;
+    }
+    const posts = findPostContainers();
+    log(`scanExistingPosts: found ${posts.length} post container(s)`);
+    posts.forEach(processPost);
+  }
+
+  let mutationCount = 0;
+  const observer = new MutationObserver((mutations) => {
+    mutationCount++;
+    if (!isOnOwnProfile()) return;
+    const containers = new Set();
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        findPostContainers(node).forEach(c => containers.add(c));
+        // Also check if the added node itself completes a post
+        if (node.querySelector?.('[data-ad-rendering-role="share_button"]')) {
+          findPostContainers(node.parentElement || node).forEach(c => containers.add(c));
+        }
+      }
+    }
+    // Catch hydration of existing skeletons by rescanning periodically when mutations occur
+    if (mutations.length > 0) {
+      findPostContainers().forEach(c => {
+        if (!processed.has(c)) containers.add(c);
+      });
+    }
+    if (containers.size > 0) {
+      log(`observer: batch #${mutationCount}, ${containers.size} post container(s)`);
+      containers.forEach(processPost);
+    }
+  });
+
+  observer.observe(document.body, { childList: true, subtree: true });
+  log('observer: attached to document.body');
+
+  let lastUrl = location.href;
+  setInterval(() => {
+    if (location.href !== lastUrl) {
+      log('URL changed:', lastUrl, '→', location.href);
+      lastUrl = location.href;
+      cachedSlug = null;
+      setTimeout(scanExistingPosts, 500);
+    }
+  }, 1000);
+
+  setTimeout(() => {
+    log('initial scan starting (after 1500ms delay)');
+    scanExistingPosts();
+  }, 1500);
+}
+
+// Run main logic once DOM is ready (the intercept above runs immediately so it
+// can patch XHR before FB issues any /api/graphql/ requests).
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', fbsrMain, { once: true });
+} else {
+  fbsrMain();
+}
