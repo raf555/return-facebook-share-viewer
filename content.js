@@ -38,16 +38,23 @@ window.__fbsrReport = window.__fbsrReport || [];
   }
 
   // Treats the indexed value as a "feedback target" rather than strictly a
-  // pfbid. For regular profile posts this is the pfbid extracted from wwwURL.
-  // For group posts (which don't have pfbids) it's the numeric post_id from
-  // the permalink_url like /groups/<g>/posts/<numeric>/. The tooltip and
-  // dialog queries accept either.
+  // pfbid. For regular posts this is the pfbid extracted from wwwURL or
+  // permalink_url (newer responses sometimes omit wwwURL entirely). For
+  // group posts (which don't have pfbids) it's the numeric post_id from
+  // the permalink like /groups/<g>/posts/<numeric>/. Both forms are valid
+  // feedbackTargetID values for the tooltip and dialog queries.
   function extractFeedbackTarget(obj) {
+    // 1. Pfbid in wwwURL (older shape — profile timeline query)
     if (typeof obj.wwwURL === 'string' && obj.wwwURL.indexOf('pfbid') !== -1) {
       const m = obj.wwwURL.match(/pfbid[A-Za-z0-9]+/);
       if (m) return m[0];
     }
-    // Group post: permalink looks like /groups/<id>/posts/<numeric>/
+    // 2. Pfbid in permalink_url (newer shape — news feed pagination query)
+    if (typeof obj.permalink_url === 'string' && obj.permalink_url.indexOf('pfbid') !== -1) {
+      const m = obj.permalink_url.match(/pfbid[A-Za-z0-9]+/);
+      if (m) return m[0];
+    }
+    // 3. Group post: numeric id in /groups/<g>/posts/<numeric>/
     if (typeof obj.permalink_url === 'string') {
       const gm = obj.permalink_url.match(/\/groups\/[^/]+\/posts\/(\d+)/);
       if (gm) return gm[1];
@@ -68,8 +75,28 @@ window.__fbsrReport = window.__fbsrReport || [];
             if (att.target && att.target.id) pfbidMap.set(att.target.id, target);
           }
         }
-        if (obj.attached_story && obj.attached_story.post_id) {
-          pfbidMap.set(obj.attached_story.post_id, target);
+        // Group post: build a composite "<groupId>:<actorId>" key. The DOM of
+        // a group post doesn't expose the post_id directly — only the group
+        // link and the poster's profile link. This composite is the only
+        // reliable way to look up the target from such DOM. Last-write-wins
+        // means we only cover the most recent post by an actor in a group,
+        // which is acceptable for feed scans.
+        if (typeof obj.permalink_url === 'string') {
+          const gm = obj.permalink_url.match(/\/groups\/[^/]+\/posts\/\d+/);
+          if (gm) {
+            const groupIdMatch = obj.permalink_url.match(/\/groups\/([^/]+)\//);
+            const groupId = groupIdMatch && groupIdMatch[1];
+            const actor = Array.isArray(obj.actors) ? obj.actors[0] : null;
+            const actorId = actor && actor.id;
+            if (groupId && actorId) {
+              pfbidMap.set(`group:${groupId}:${actorId}`, target);
+            }
+          }
+        }
+        if (obj.attached_story) {
+          if (obj.attached_story.post_id && !pfbidMap.has(obj.attached_story.post_id)) {
+            pfbidMap.set(obj.attached_story.post_id, target);
+          }
         }
       }
     }
@@ -106,7 +133,8 @@ window.__fbsrReport = window.__fbsrReport || [];
   }
 
   function processBody(text) {
-    if (!text || text.indexOf('pfbid') === -1) return;
+    if (!text || text.indexOf('pfbid') === -1 && text.indexOf('/groups/') === -1) return;
+    const beforeSize = pfbidMap.size;
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
       try {
@@ -114,6 +142,14 @@ window.__fbsrReport = window.__fbsrReport || [];
         indexResponseForPfbids(parsed);
         indexShareCountsFromEdges(parsed);
       } catch (e) { /* ignore */ }
+    }
+    // Notify any listener that new entries have been indexed. The main script
+    // uses this to re-scan posts that didn't have a pfbid on first pass.
+    if (pfbidMap.size > beforeSize) {
+      const cb = window.__fbsrOnMapUpdate;
+      if (typeof cb === 'function') {
+        try { cb(); } catch (e) { /* ignore */ }
+      }
     }
   }
 
@@ -452,18 +488,27 @@ function fbsrMain() {
       log('found pfbid via DOM:', m[0].slice(0, 20) + '…');
       return m[0];
     }
-    // 2. Group post: DOM exposes /groups/<g>/posts/<numeric>/ directly. The
-    //    numeric id IS the feedback target for groups (no pfbid layer).
+    // 2. Group post permalink with explicit post id: /groups/<g>/posts/<numeric>/
     const gm = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
     if (gm) {
       log(`found group post target via DOM: ${gm[1]}`);
       return gm[1];
     }
-    // 3. Fallback: consult the network-intercept map. Try every long numeric
-    //    ID in the container. Map is keyed by post_id, media.id, target.id,
-    //    and attached_story.post_id (values: pfbid OR numeric for groups).
     const map = window.__fbsrPfbidMap;
     if (map && map.size) {
+      // 3. Composite key lookup: some group posts only expose the group link
+      //    and the poster's user link in the DOM (no post id at all). Build
+      //    a "group:<groupId>:<actorId>" key from the DOM and try the map.
+      const groupOnly = html.match(/\/groups\/(\d+)\/user\/(\d+)\//);
+      if (groupOnly) {
+        const compositeKey = `group:${groupOnly[1]}:${groupOnly[2]}`;
+        const target = map.get(compositeKey);
+        if (target) {
+          log(`found target via composite group key: ${compositeKey} -> ${String(target).slice(0, 20)}…`);
+          return target;
+        }
+      }
+      // 4. Map lookup by any long numeric ID in the container.
       const ids = new Set(html.match(/\b\d{14,20}\b/g) || []);
       for (const id of ids) {
         const target = map.get(id);
@@ -1148,6 +1193,22 @@ function fbsrMain() {
     log('initial scan starting (after 1500ms delay)');
     scanExistingPosts();
   }, 1500);
+
+  // When the intercept indexes new entries, re-scan posts that didn't have
+  // a pfbid on first pass. processed is a WeakSet keyed by article, and
+  // processPost early-exits if already present, so this is safe — only
+  // newly-unprocessed articles (those we explicitly removed via
+  // processed.delete) will be re-tried.
+  let mapRescanTimer = null;
+  window.__fbsrOnMapUpdate = () => {
+    if (mapRescanTimer) return;
+    // Debounce: many responses can arrive in a short burst.
+    mapRescanTimer = setTimeout(() => {
+      mapRescanTimer = null;
+      log('mapUpdate: re-scanning posts');
+      scanExistingPosts();
+    }, 250);
+  };
 }
 
 // Run main logic once DOM is ready (the intercept above runs immediately so it
