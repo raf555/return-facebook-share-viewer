@@ -898,29 +898,39 @@ function fbsrMain() {
     const hasAttachment = (node?.attachments?.length || 0) > 0
       || (node?.comet_sections?.content?.story?.attachments?.length || 0) > 0
       || !!node?.attached_story;
+    const profileHref = actor.profile_url || actor.url || '#';
+    const postHref = node.permalink_url || '#';
 
     const card = document.createElement('div');
     card.className = 'fbsr-sharer-card';
 
-    const header = document.createElement('a');
+    const header = document.createElement('div');
     header.className = 'fbsr-sharer-header';
-    header.href = actor.profile_url || actor.url || '#';
-    header.target = '_blank';
-    header.rel = 'noopener noreferrer';
 
+    // Avatar → profile
+    const avatarLink = document.createElement('a');
+    avatarLink.href = profileHref;
+    avatarLink.target = '_blank';
+    avatarLink.rel = 'noopener noreferrer';
+    avatarLink.className = 'fbsr-sharer-avatar-link';
     const img = document.createElement('img');
     img.className = 'fbsr-sharer-avatar';
     img.src = actor.profile_picture?.uri || '';
     img.alt = '';
     img.referrerPolicy = 'no-referrer';
+    avatarLink.appendChild(img);
 
     const info = document.createElement('div');
     info.className = 'fbsr-sharer-info';
 
-    const name = document.createElement('div');
-    name.className = 'fbsr-sharer-name';
-    name.textContent = actor.name;
-    info.appendChild(name);
+    // Name → profile
+    const nameLink = document.createElement('a');
+    nameLink.className = 'fbsr-sharer-name';
+    nameLink.href = profileHref;
+    nameLink.target = '_blank';
+    nameLink.rel = 'noopener noreferrer';
+    nameLink.textContent = actor.name;
+    info.appendChild(nameLink);
 
     // Friend descriptor like "shared a memory." if present in the title.
     const titleStory = shareStory.comet_sections?.title?.story;
@@ -931,14 +941,19 @@ function fbsrMain() {
         const sub = document.createElement('span');
         sub.className = 'fbsr-sharer-title-trail';
         sub.textContent = ' ' + trailing;
-        name.appendChild(sub);
+        nameLink.appendChild(sub);
       }
     }
 
     const metaRow = document.createElement('div');
     metaRow.className = 'fbsr-sharer-meta';
     if (creationTime) {
-      const ts = document.createElement('span');
+      // Timestamp → the reshare post itself
+      const ts = document.createElement('a');
+      ts.className = 'fbsr-sharer-timestamp';
+      ts.href = postHref;
+      ts.target = '_blank';
+      ts.rel = 'noopener noreferrer';
       ts.textContent = formatRelativeTime(creationTime);
       metaRow.appendChild(ts);
     }
@@ -957,6 +972,7 @@ function fbsrMain() {
     }
     if (metaRow.childNodes.length) info.appendChild(metaRow);
 
+    // Caption is plain text, no link.
     if (captionText) {
       const caption = document.createElement('div');
       caption.className = 'fbsr-sharer-caption';
@@ -964,14 +980,19 @@ function fbsrMain() {
       info.appendChild(caption);
     }
 
-    header.appendChild(img);
+    header.appendChild(avatarLink);
     header.appendChild(info);
     card.appendChild(header);
 
-    if (hasAttachment && node.permalink_url) {
+    // Show Attachment → the ORIGINAL post (attached_story's permalink), not
+    // the reshare. The reshare is already accessible via the timestamp link.
+    const attachedStory = node?.attached_story
+      || node?.comet_sections?.content?.story?.attached_story;
+    const originalHref = attachedStory?.permalink_url || attachedStory?.url || null;
+    if (hasAttachment && originalHref) {
       const showBtn = document.createElement('a');
       showBtn.className = 'fbsr-sharer-attachment-btn';
-      showBtn.href = node.permalink_url;
+      showBtn.href = originalHref;
       showBtn.target = '_blank';
       showBtn.rel = 'noopener noreferrer';
       showBtn.textContent = 'Show Attachment';

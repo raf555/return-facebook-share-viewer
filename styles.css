@@ -177,12 +177,12 @@ html[data-theme="dark"] .fbsr-sharer-card,
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  text-decoration: none;
-  color: inherit;
 }
 
-.fbsr-sharer-header:hover .fbsr-sharer-name {
-  text-decoration: underline;
+.fbsr-sharer-avatar-link {
+  display: block;
+  flex-shrink: 0;
+  text-decoration: none;
 }
 
 .fbsr-sharer-avatar {
@@ -190,8 +190,8 @@ html[data-theme="dark"] .fbsr-sharer-card,
   height: 40px;
   border-radius: 50%;
   object-fit: cover;
-  flex-shrink: 0;
   background: #e4e6eb;
+  display: block;
 }
 
 .fbsr-sharer-info {
@@ -203,6 +203,13 @@ html[data-theme="dark"] .fbsr-sharer-card,
   font-weight: 600;
   font-size: 15px;
   line-height: 1.3;
+  color: inherit;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.fbsr-sharer-name:hover {
+  text-decoration: underline;
 }
 
 .fbsr-sharer-title-trail {
@@ -227,6 +234,15 @@ html[data-theme="dark"] .fbsr-sharer-title-trail,
 html[data-theme="dark"] .fbsr-sharer-meta,
 .__fb-dark-mode .fbsr-sharer-meta {
   color: #b0b3b8;
+}
+
+.fbsr-sharer-timestamp {
+  color: inherit;
+  text-decoration: none;
+}
+
+.fbsr-sharer-timestamp:hover {
+  text-decoration: underline;
 }
 
 .fbsr-sharer-privacy {
