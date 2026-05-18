@@ -91,10 +91,18 @@ html[data-theme="dark"] .fbsr-modal,
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 16px;
+  padding: 14px 16px;
   border-bottom: 1px solid #ced0d4;
   font-size: 17px;
   font-weight: 700;
+  position: relative;
+}
+
+.fbsr-modal-title {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
 }
 
 html[data-theme="dark"] .fbsr-modal-header,
@@ -103,29 +111,42 @@ html[data-theme="dark"] .fbsr-modal-header,
 }
 
 .fbsr-modal-close {
-  background: none;
+  background: rgba(0, 0, 0, 0.05);
   border: none;
-  font-size: 24px;
+  font-size: 20px;
   cursor: pointer;
   color: inherit;
-  padding: 4px 8px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
 }
 
 .fbsr-modal-close:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme="dark"] .fbsr-modal-close,
+.__fb-dark-mode .fbsr-modal-close {
+  background: rgba(255, 255, 255, 0.1);
 }
 
 html[data-theme="dark"] .fbsr-modal-close:hover,
 .__fb-dark-mode .fbsr-modal-close:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.2);
 }
 
 .fbsr-modal-body {
   overflow-y: auto;
-  padding: 8px 0;
+  padding: 12px;
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .fbsr-modal-status {
@@ -139,22 +160,29 @@ html[data-theme="dark"] .fbsr-modal-status,
   color: #b0b3b8;
 }
 
-.fbsr-sharer-row {
+/* Each sharer is its own bordered card, matching FB's reshare dialog style. */
+.fbsr-sharer-card {
+  border: 1px solid #ced0d4;
+  border-radius: 8px;
+  padding: 12px;
+  background: transparent;
+}
+
+html[data-theme="dark"] .fbsr-sharer-card,
+.__fb-dark-mode .fbsr-sharer-card {
+  border-color: #3e4042;
+}
+
+.fbsr-sharer-header {
   display: flex;
-  align-items: center;
-  padding: 8px 16px;
+  align-items: flex-start;
   gap: 12px;
   text-decoration: none;
   color: inherit;
 }
 
-.fbsr-sharer-row:hover {
-  background: #f0f2f5;
-}
-
-html[data-theme="dark"] .fbsr-sharer-row:hover,
-.__fb-dark-mode .fbsr-sharer-row:hover {
-  background: #3a3b3c;
+.fbsr-sharer-header:hover .fbsr-sharer-name {
+  text-decoration: underline;
 }
 
 .fbsr-sharer-avatar {
@@ -174,12 +202,26 @@ html[data-theme="dark"] .fbsr-sharer-row:hover,
 .fbsr-sharer-name {
   font-weight: 600;
   font-size: 15px;
+  line-height: 1.3;
+}
+
+.fbsr-sharer-title-trail {
+  font-weight: 400;
+  color: #65676b;
+}
+
+html[data-theme="dark"] .fbsr-sharer-title-trail,
+.__fb-dark-mode .fbsr-sharer-title-trail {
+  color: #b0b3b8;
 }
 
 .fbsr-sharer-meta {
   font-size: 13px;
   color: #65676b;
   margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 
 html[data-theme="dark"] .fbsr-sharer-meta,
@@ -187,14 +229,42 @@ html[data-theme="dark"] .fbsr-sharer-meta,
   color: #b0b3b8;
 }
 
+.fbsr-sharer-privacy {
+  font-size: 11px;
+  line-height: 1;
+}
+
 .fbsr-sharer-caption {
-  font-size: 13px;
-  margin-top: 4px;
+  font-size: 14px;
+  margin-top: 8px;
   color: #050505;
   word-wrap: break-word;
+  line-height: 1.35;
 }
 
 html[data-theme="dark"] .fbsr-sharer-caption,
 .__fb-dark-mode .fbsr-sharer-caption {
   color: #e4e6eb;
+}
+
+.fbsr-sharer-attachment-btn {
+  display: block;
+  text-align: center;
+  margin-top: 10px;
+  padding: 6px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1877f2;
+  text-decoration: none;
+  border-radius: 6px;
+}
+
+.fbsr-sharer-attachment-btn:hover {
+  background: rgba(24, 119, 242, 0.08);
+  text-decoration: underline;
+}
+
+html[data-theme="dark"] .fbsr-sharer-attachment-btn,
+.__fb-dark-mode .fbsr-sharer-attachment-btn {
+  color: #4599ff;
 }

@@ -15,11 +15,31 @@ window.__fbsrReport = window.__fbsrReport || [];
 (function installPfbidIntercept() {
   if (window.__fbsrPfbidMap) return; // already installed
   const pfbidMap = new Map();
+  const shareCountMap = new Map(); // pfbid -> share count (number)
   window.__fbsrPfbidMap = pfbidMap;
+  window.__fbsrShareCountMap = shareCountMap;
 
-  function indexResponseForPfbids(obj) {
+  // Walks a top-level post object to find its share_count.count buried under
+  // comet_sections/feedback/.../comet_ufi_summary_and_actions_renderer/feedback.
+  // Avoids descending into attached_story so we don't pick up the original
+  // post's count when this is a reshare.
+  function findShareCount(o) {
+    if (!o || typeof o !== 'object') return null;
+    if (o.share_count && typeof o.share_count.count === 'number') return o.share_count.count;
+    for (const k in o) {
+      if (k === 'attached_story') continue;
+      const v = o[k];
+      if (v && typeof v === 'object') {
+        const found = findShareCount(v);
+        if (found !== null) return found;
+      }
+    }
+    return null;
+  }
+
+  function indexResponseForPfbids(obj, insideAttachedStory) {
     if (!obj || typeof obj !== 'object') return;
-    if (typeof obj.post_id === 'string' && typeof obj.wwwURL === 'string' && obj.wwwURL.indexOf('pfbid') !== -1) {
+    if (!insideAttachedStory && typeof obj.post_id === 'string' && typeof obj.wwwURL === 'string' && obj.wwwURL.indexOf('pfbid') !== -1) {
       const m = obj.wwwURL.match(/pfbid[A-Za-z0-9]+/);
       if (m) {
         const pfbid = m[0];
@@ -27,29 +47,63 @@ window.__fbsrReport = window.__fbsrReport || [];
         if (Array.isArray(obj.attachments)) {
           for (const att of obj.attachments) {
             if (!att) continue;
-            // Photos and most other media use media.id.
             if (att.media && att.media.id) pfbidMap.set(att.media.id, pfbid);
-            // Reels and video reshares expose their numeric id under target.id
-            // (and the DOM uses this value in the /reel/<id>/ permalink).
             if (att.target && att.target.id) pfbidMap.set(att.target.id, pfbid);
           }
         }
         if (obj.attached_story && obj.attached_story.post_id) {
           pfbidMap.set(obj.attached_story.post_id, pfbid);
         }
+        // Try to extract the share count too — if present in the response we
+        // can skip the tooltip query entirely (saves an API call per post and
+        // avoids rate limiting on long profile scrolls).
+        // Search ONE level up if this object doesn't itself have comet_sections
+        // (the post may be the root and comet_sections sits on its parent).
       }
     }
     for (const k in obj) {
       const v = obj[k];
-      if (v && typeof v === 'object') indexResponseForPfbids(v);
+      if (v && typeof v === 'object') {
+        indexResponseForPfbids(v, insideAttachedStory || k === 'attached_story');
+      }
     }
+  }
+
+  // Second pass: walk top-level feed edges to associate share_count with
+  // the post's pfbid. Done separately so we don't blow up the recursive
+  // indexer with extra logic.
+  function indexShareCountsFromEdges(obj) {
+    if (!obj || typeof obj !== 'object') return;
+    // Find the timeline_list_feed_units.edges array OR a node carrying both
+    // a comet_sections branch and a wwwURL/post_id pair.
+    function visit(node) {
+      if (!node || typeof node !== 'object') return;
+      // A node that LOOKS like a feed unit: has comet_sections AND a story
+      // containing post_id+wwwURL.
+      const story = node?.comet_sections?.content?.story;
+      if (story && typeof story.post_id === 'string' && typeof story.wwwURL === 'string' && story.wwwURL.indexOf('pfbid') !== -1) {
+        const pfbid = story.wwwURL.match(/pfbid[A-Za-z0-9]+/)[0];
+        const count = findShareCount(node.comet_sections);
+        if (count !== null) shareCountMap.set(pfbid, count);
+      }
+      for (const k in node) {
+        if (k === 'attached_story') continue;
+        const v = node[k];
+        if (v && typeof v === 'object') visit(v);
+      }
+    }
+    visit(obj);
   }
 
   function processBody(text) {
     if (!text || text.indexOf('pfbid') === -1) return;
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
-      try { indexResponseForPfbids(JSON.parse(line)); } catch (e) { /* ignore */ }
+      try {
+        const parsed = JSON.parse(line);
+        indexResponseForPfbids(parsed);
+        indexShareCountsFromEdges(parsed);
+      } catch (e) { /* ignore */ }
     }
   }
 
@@ -79,6 +133,12 @@ window.__fbsrReport = window.__fbsrReport || [];
 
 function fbsrMain() {
   'use strict';
+
+  // Set to false to enable the extension on every FB page (groups, news feed,
+  // other users' profiles, etc.). When true, runs only on the logged-in
+  // user's own profile, matching the original scope. The intercept above
+  // runs regardless of this flag.
+  const RESTRICT_TO_OWN_PROFILE = false;
 
   // ============================================================
   // Debug logging
@@ -451,28 +511,31 @@ function fbsrMain() {
       return;
     }
 
-    let data;
-    try {
-      data = await tooltipQuery(pfbid);
-    } catch (e) {
-      err(`processPost #${postIdx}: tooltip query threw`, e);
-      return;
+    // Use the count from the intercepted feed response. If it's not present
+    // (older response shape, or response not yet seen), fall back to a single
+    // tooltip query. The tooltip's resharer list is fetched LAZILY on first
+    // hover, not here — avoids per-post API calls on viewport entry and
+    // keeps us well clear of FB's rate limit during long scrolls.
+    let count = window.__fbsrShareCountMap && window.__fbsrShareCountMap.get(pfbid);
+    if (typeof count !== 'number') {
+      log(`processPost #${postIdx}: count not cached, falling back to tooltipQuery`);
+      try {
+        const data = await tooltipQuery(pfbid);
+        count = data?.data?.feedback?.reshares?.count;
+      } catch (e) {
+        err(`processPost #${postIdx}: tooltip query threw`, e);
+        return;
+      }
     }
-    const count = data?.data?.feedback?.reshares?.count;
-    const feedbackId = data?.data?.feedback?.id;
-    log(`processPost #${postIdx}: SHARE COUNT REPORT`);
-    log(`  pfbid: ${pfbid}`);
-    log(`  feedbackId: ${feedbackId}`);
-    log(`  count: ${count}`);
-    log(`  message: "${messagePreview}"`);
+    log(`processPost #${postIdx}: pfbid=${pfbid.slice(0, 24)}… count=${count}`);
     window.__fbsrReport.push({ postIdx, pfbid, count, message: messagePreview });
     if (!count || count <= 0) {
       log(`processPost #${postIdx}: count is zero, skipping injection`);
       return;
     }
-    log(`processPost #${postIdx}: count > 0, proceeding to inject`);
 
-    injectLink(article, pfbid, count, data.data.feedback.legacy_resharers || [], postIdx);
+    // Pass empty resharers — the tooltip will fetch them on first hover.
+    injectLink(article, pfbid, count, [], postIdx);
   }
 
   function injectLink(article, pfbid, count, initialResharers, postIdx) {
@@ -490,20 +553,47 @@ function fbsrMain() {
     link.className = 'fbsr-link';
     link.href = '#';
     link.textContent = count === 1 ? '1 share' : `${count} shares`;
-    // DEBUG: temporary inline styles to make link unmissable
-    link.style.cssText = 'display:inline-block !important; padding:6px 12px !important; background:#ff00ff !important; color:#fff !important; font-weight:bold !important; border:2px solid #000 !important; border-radius:4px !important; margin:8px !important; text-decoration:none !important; z-index:9999 !important;';
-    container.style.cssText = 'display:block !important; padding:4px !important; background:rgba(255,255,0,0.3) !important;';
-
     let tooltipEl = null;
     let hoverTimer = null;
-    let tooltipData = initialResharers;
+    // Lazy: tooltipData is null until first hover triggers a fetch. If we
+    // were handed initialResharers from a prior tooltipQuery call (legacy
+    // path), use those.
+    let tooltipData = initialResharers && initialResharers.length ? initialResharers : null;
+    let tooltipFetchInFlight = false;
+
+    async function ensureTooltipData() {
+      if (tooltipData || tooltipFetchInFlight) return;
+      tooltipFetchInFlight = true;
+      try {
+        const data = await tooltipQuery(pfbid);
+        tooltipData = data?.data?.feedback?.legacy_resharers || [];
+        // Re-render if the tooltip is still visible.
+        if (tooltipEl) renderTooltipContent(tooltipEl, tooltipData, count);
+      } catch (e) {
+        err(`tooltip #${postIdx}: fetch failed`, e);
+        tooltipData = [];
+        if (tooltipEl) renderTooltipContent(tooltipEl, tooltipData, count);
+      } finally {
+        tooltipFetchInFlight = false;
+      }
+    }
 
     function showTooltip() {
       if (tooltipEl) return;
       log(`tooltip #${postIdx}: showing`);
       tooltipEl = document.createElement('div');
       tooltipEl.className = 'fbsr-tooltip';
-      renderTooltipContent(tooltipEl, tooltipData, count);
+      // If we don't have the data yet, render a loading state and trigger
+      // the fetch. ensureTooltipData() re-renders when data arrives.
+      if (tooltipData) {
+        renderTooltipContent(tooltipEl, tooltipData, count);
+      } else {
+        const loading = document.createElement('span');
+        loading.className = 'fbsr-tooltip-loading';
+        loading.textContent = 'Loading…';
+        tooltipEl.appendChild(loading);
+        ensureTooltipData();
+      }
       document.body.appendChild(tooltipEl);
       positionTooltip(tooltipEl, link);
     }
@@ -620,7 +710,8 @@ function fbsrMain() {
     const header = document.createElement('div');
     header.className = 'fbsr-modal-header';
     const title = document.createElement('span');
-    title.textContent = count === 1 ? 'Shared by 1 person' : `Shared by ${count} people`;
+    title.className = 'fbsr-modal-title';
+    title.textContent = 'People who shared this';
     const closeBtn = document.createElement('button');
     closeBtn.className = 'fbsr-modal-close';
     closeBtn.textContent = '×';
@@ -790,24 +881,32 @@ function fbsrMain() {
     }
 
     let creationTime = null;
-    let privacy = null;
+    let privacyDesc = null;
+    let privacyIconName = null;
     for (const m of shareStory.comet_sections?.metadata || []) {
       const tn = m.__typename;
       if (tn === 'CometFeedStoryLongerTimestampStrategy' && m.story?.creation_time) {
         creationTime = m.story.creation_time;
       } else if (tn === 'CometFeedStoryAudienceStrategy') {
-        privacy = m.story?.privacy_scope?.description;
+        privacyDesc = m.story?.privacy_scope?.description;
+        privacyIconName = m.story?.privacy_scope?.icon_image?.name;
       }
     }
 
     const captionText =
       node?.comet_sections?.content?.story?.comet_sections?.message?.story?.message?.text;
+    const hasAttachment = (node?.attachments?.length || 0) > 0
+      || (node?.comet_sections?.content?.story?.attachments?.length || 0) > 0
+      || !!node?.attached_story;
 
-    const a = document.createElement('a');
-    a.className = 'fbsr-sharer-row';
-    a.href = node.permalink_url || actor.profile_url || '#';
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
+    const card = document.createElement('div');
+    card.className = 'fbsr-sharer-card';
+
+    const header = document.createElement('a');
+    header.className = 'fbsr-sharer-header';
+    header.href = actor.profile_url || actor.url || '#';
+    header.target = '_blank';
+    header.rel = 'noopener noreferrer';
 
     const img = document.createElement('img');
     img.className = 'fbsr-sharer-avatar';
@@ -823,15 +922,40 @@ function fbsrMain() {
     name.textContent = actor.name;
     info.appendChild(name);
 
-    const metaBits = [];
-    if (creationTime) metaBits.push(formatRelativeTime(creationTime));
-    if (privacy) metaBits.push(privacy);
-    if (metaBits.length) {
-      const meta = document.createElement('div');
-      meta.className = 'fbsr-sharer-meta';
-      meta.textContent = metaBits.join(' · ');
-      info.appendChild(meta);
+    // Friend descriptor like "shared a memory." if present in the title.
+    const titleStory = shareStory.comet_sections?.title?.story;
+    const titleText = titleStory?.title?.text;
+    if (titleText && titleText.indexOf(actor.name) === 0) {
+      const trailing = titleText.slice(actor.name.length).trim();
+      if (trailing) {
+        const sub = document.createElement('span');
+        sub.className = 'fbsr-sharer-title-trail';
+        sub.textContent = ' ' + trailing;
+        name.appendChild(sub);
+      }
     }
+
+    const metaRow = document.createElement('div');
+    metaRow.className = 'fbsr-sharer-meta';
+    if (creationTime) {
+      const ts = document.createElement('span');
+      ts.textContent = formatRelativeTime(creationTime);
+      metaRow.appendChild(ts);
+    }
+    if (privacyIconName || privacyDesc) {
+      if (creationTime) {
+        const dot = document.createElement('span');
+        dot.className = 'fbsr-sharer-dot';
+        dot.textContent = ' · ';
+        metaRow.appendChild(dot);
+      }
+      const pIcon = document.createElement('span');
+      pIcon.className = 'fbsr-sharer-privacy';
+      pIcon.title = privacyDesc || '';
+      pIcon.textContent = privacyIconToGlyph(privacyIconName);
+      metaRow.appendChild(pIcon);
+    }
+    if (metaRow.childNodes.length) info.appendChild(metaRow);
 
     if (captionText) {
       const caption = document.createElement('div');
@@ -840,9 +964,35 @@ function fbsrMain() {
       info.appendChild(caption);
     }
 
-    a.appendChild(img);
-    a.appendChild(info);
-    return a;
+    header.appendChild(img);
+    header.appendChild(info);
+    card.appendChild(header);
+
+    if (hasAttachment && node.permalink_url) {
+      const showBtn = document.createElement('a');
+      showBtn.className = 'fbsr-sharer-attachment-btn';
+      showBtn.href = node.permalink_url;
+      showBtn.target = '_blank';
+      showBtn.rel = 'noopener noreferrer';
+      showBtn.textContent = 'Show Attachment';
+      card.appendChild(showBtn);
+    }
+
+    return card;
+  }
+
+  function privacyIconToGlyph(name) {
+    // FB's privacy icon names. Use unicode glyphs so we don't depend on icons.
+    switch (name) {
+      case 'globe':
+      case 'everyone':
+      case 'public': return '🌐';
+      case 'friends': return '👥';
+      case 'only_me':
+      case 'lock': return '🔒';
+      case 'custom': return '⚙';
+      default: return '·';
+    }
   }
 
   function formatRelativeTime(unix) {
@@ -881,8 +1031,7 @@ function fbsrMain() {
   }
 
   function scanExistingPosts() {
-    const onProfile = isOnOwnProfile();
-    if (!onProfile) {
+    if (RESTRICT_TO_OWN_PROFILE && !isOnOwnProfile()) {
       log('scanExistingPosts: not on own profile, skipping scan');
       return;
     }
@@ -894,7 +1043,7 @@ function fbsrMain() {
   let mutationCount = 0;
   const observer = new MutationObserver((mutations) => {
     mutationCount++;
-    if (!isOnOwnProfile()) return;
+    if (RESTRICT_TO_OWN_PROFILE && !isOnOwnProfile()) return;
     const containers = new Set();
     for (const m of mutations) {
       for (const node of m.addedNodes) {
