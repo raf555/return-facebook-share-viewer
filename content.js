@@ -748,10 +748,36 @@ function fbsrMain() {
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
 
+    // Prevent the page behind the modal from scrolling. FB applies
+    // overflow-y: scroll on <html> with !important, so we can't beat it by
+    // setting overflow there. Instead, freeze the body in place via
+    // position: fixed and re-apply the current scroll offset as a negative
+    // top, then restore on close.
+    const scrollY = window.scrollY;
+    const prevBodyStyle = {
+      position: document.body.style.position,
+      top: document.body.style.top,
+      left: document.body.style.left,
+      right: document.body.style.right,
+      width: document.body.style.width,
+    };
+    document.body.style.position = 'fixed';
+    document.body.style.top = `-${scrollY}px`;
+    document.body.style.left = '0';
+    document.body.style.right = '0';
+    document.body.style.width = '100%';
+
     function close() {
       log('modal: closing');
       backdrop.remove();
       document.removeEventListener('keydown', onKey);
+      // Restore body styles and scroll position.
+      document.body.style.position = prevBodyStyle.position;
+      document.body.style.top = prevBodyStyle.top;
+      document.body.style.left = prevBodyStyle.left;
+      document.body.style.right = prevBodyStyle.right;
+      document.body.style.width = prevBodyStyle.width;
+      window.scrollTo(0, scrollY);
     }
     function onKey(e) {
       if (e.key === 'Escape') close();
