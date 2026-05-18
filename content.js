@@ -37,28 +37,40 @@ window.__fbsrReport = window.__fbsrReport || [];
     return null;
   }
 
+  // Treats the indexed value as a "feedback target" rather than strictly a
+  // pfbid. For regular profile posts this is the pfbid extracted from wwwURL.
+  // For group posts (which don't have pfbids) it's the numeric post_id from
+  // the permalink_url like /groups/<g>/posts/<numeric>/. The tooltip and
+  // dialog queries accept either.
+  function extractFeedbackTarget(obj) {
+    if (typeof obj.wwwURL === 'string' && obj.wwwURL.indexOf('pfbid') !== -1) {
+      const m = obj.wwwURL.match(/pfbid[A-Za-z0-9]+/);
+      if (m) return m[0];
+    }
+    // Group post: permalink looks like /groups/<id>/posts/<numeric>/
+    if (typeof obj.permalink_url === 'string') {
+      const gm = obj.permalink_url.match(/\/groups\/[^/]+\/posts\/(\d+)/);
+      if (gm) return gm[1];
+    }
+    return null;
+  }
+
   function indexResponseForPfbids(obj, insideAttachedStory) {
     if (!obj || typeof obj !== 'object') return;
-    if (!insideAttachedStory && typeof obj.post_id === 'string' && typeof obj.wwwURL === 'string' && obj.wwwURL.indexOf('pfbid') !== -1) {
-      const m = obj.wwwURL.match(/pfbid[A-Za-z0-9]+/);
-      if (m) {
-        const pfbid = m[0];
-        pfbidMap.set(obj.post_id, pfbid);
+    if (!insideAttachedStory && typeof obj.post_id === 'string') {
+      const target = extractFeedbackTarget(obj);
+      if (target) {
+        pfbidMap.set(obj.post_id, target);
         if (Array.isArray(obj.attachments)) {
           for (const att of obj.attachments) {
             if (!att) continue;
-            if (att.media && att.media.id) pfbidMap.set(att.media.id, pfbid);
-            if (att.target && att.target.id) pfbidMap.set(att.target.id, pfbid);
+            if (att.media && att.media.id) pfbidMap.set(att.media.id, target);
+            if (att.target && att.target.id) pfbidMap.set(att.target.id, target);
           }
         }
         if (obj.attached_story && obj.attached_story.post_id) {
-          pfbidMap.set(obj.attached_story.post_id, pfbid);
+          pfbidMap.set(obj.attached_story.post_id, target);
         }
-        // Try to extract the share count too — if present in the response we
-        // can skip the tooltip query entirely (saves an API call per post and
-        // avoids rate limiting on long profile scrolls).
-        // Search ONE level up if this object doesn't itself have comet_sections
-        // (the post may be the root and comet_sections sits on its parent).
       }
     }
     for (const k in obj) {
@@ -70,21 +82,19 @@ window.__fbsrReport = window.__fbsrReport || [];
   }
 
   // Second pass: walk top-level feed edges to associate share_count with
-  // the post's pfbid. Done separately so we don't blow up the recursive
-  // indexer with extra logic.
+  // the post's feedback target. Done separately so we don't blow up the
+  // recursive indexer with extra logic.
   function indexShareCountsFromEdges(obj) {
     if (!obj || typeof obj !== 'object') return;
-    // Find the timeline_list_feed_units.edges array OR a node carrying both
-    // a comet_sections branch and a wwwURL/post_id pair.
     function visit(node) {
       if (!node || typeof node !== 'object') return;
-      // A node that LOOKS like a feed unit: has comet_sections AND a story
-      // containing post_id+wwwURL.
       const story = node?.comet_sections?.content?.story;
-      if (story && typeof story.post_id === 'string' && typeof story.wwwURL === 'string' && story.wwwURL.indexOf('pfbid') !== -1) {
-        const pfbid = story.wwwURL.match(/pfbid[A-Za-z0-9]+/)[0];
-        const count = findShareCount(node.comet_sections);
-        if (count !== null) shareCountMap.set(pfbid, count);
+      if (story && typeof story.post_id === 'string') {
+        const target = extractFeedbackTarget(story) || extractFeedbackTarget(node);
+        if (target) {
+          const count = findShareCount(node.comet_sections);
+          if (count !== null) shareCountMap.set(target, count);
+        }
       }
       for (const k in node) {
         if (k === 'attached_story') continue;
@@ -436,28 +446,35 @@ function fbsrMain() {
       return null;
     }
     const html = article.outerHTML;
-    // 1. DOM scrape (works when FB has hydrated the timestamp link).
+    // 1. DOM scrape: pfbid in the rendered timestamp link.
     const m = html.match(/pfbid[A-Za-z0-9]+/);
     if (m) {
       log('found pfbid via DOM:', m[0].slice(0, 20) + '…');
       return m[0];
     }
-    // 2. Fallback: consult the network-intercept map. Try every long
-    //    numeric ID we can pull out of the container. The map is keyed by
-    //    post_id, attachment.media.id, and attached_story.post_id.
+    // 2. Group post: DOM exposes /groups/<g>/posts/<numeric>/ directly. The
+    //    numeric id IS the feedback target for groups (no pfbid layer).
+    const gm = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
+    if (gm) {
+      log(`found group post target via DOM: ${gm[1]}`);
+      return gm[1];
+    }
+    // 3. Fallback: consult the network-intercept map. Try every long numeric
+    //    ID in the container. Map is keyed by post_id, media.id, target.id,
+    //    and attached_story.post_id (values: pfbid OR numeric for groups).
     const map = window.__fbsrPfbidMap;
     if (map && map.size) {
       const ids = new Set(html.match(/\b\d{14,20}\b/g) || []);
       for (const id of ids) {
-        const pfbid = map.get(id);
-        if (pfbid) {
-          log(`found pfbid via map: id=${id} -> ${pfbid.slice(0, 20)}…`);
-          return pfbid;
+        const target = map.get(id);
+        if (target) {
+          log(`found target via map: id=${id} -> ${String(target).slice(0, 20)}…`);
+          return target;
         }
       }
-      log(`no pfbid in DOM; tried ${ids.size} ids against map (size ${map.size}), no match`);
+      log(`no target in DOM; tried ${ids.size} ids against map (size ${map.size}), no match`);
     } else {
-      log('no pfbid found in article, map empty');
+      log('no target found in article, map empty');
     }
     return null;
   }
