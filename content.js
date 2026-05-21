@@ -5,6 +5,14 @@
 
 window.__fbsrReport = window.__fbsrReport || [];
 
+// Debug switch shared between the document_start intercept and fbsrMain.
+// When true:
+//   - Captures every /api/graphql/ response body into window.__feedBodies
+//     so you can run diagnostics without re-installing a capture each time.
+//   - Logs are enabled in fbsrMain (the local DEBUG inside fbsrMain mirrors
+//     this — set both to false for quiet operation).
+window.__FBSR_DEBUG = true;
+
 // =============================================================
 // PFBID NETWORK INTERCEPT (runs at document_start, before FB code)
 // Patches XMLHttpRequest to read /api/graphql/ responses, extracts
@@ -75,21 +83,34 @@ window.__fbsrReport = window.__fbsrReport || [];
             if (att.target && att.target.id) pfbidMap.set(att.target.id, target);
           }
         }
-        // Group post: build a composite "<groupId>:<actorId>" key. The DOM of
-        // a group post doesn't expose the post_id directly — only the group
-        // link and the poster's profile link. This composite is the only
-        // reliable way to look up the target from such DOM. Last-write-wins
-        // means we only cover the most recent post by an actor in a group,
-        // which is acceptable for feed scans.
+        // Group post: build "group:<id>:<actorId>" composite keys. The DOM
+        // of a group post doesn't expose the post_id directly — only the
+        // group link and the poster's profile link. Last-write-wins means
+        // we only cover the most recent post by an actor in a group, which
+        // is acceptable for feed scans.
+        //
+        // FB serves groups by both vanity slug and numeric id. The
+        // permalink_url uses whichever the group was navigated by (often the
+        // vanity), but the DOM's user-link uses the numeric form. So we
+        // index BOTH variants whenever we can find them.
         if (typeof obj.permalink_url === 'string') {
           const gm = obj.permalink_url.match(/\/groups\/[^/]+\/posts\/\d+/);
           if (gm) {
             const groupIdMatch = obj.permalink_url.match(/\/groups\/([^/]+)\//);
-            const groupId = groupIdMatch && groupIdMatch[1];
+            const groupIdFromUrl = groupIdMatch && groupIdMatch[1];
+            // Numeric group id lives on feedback.associated_group.id — usable
+            // even when the permalink uses a vanity slug.
+            const numericGroupId =
+              obj.feedback && obj.feedback.associated_group && obj.feedback.associated_group.id;
             const actor = Array.isArray(obj.actors) ? obj.actors[0] : null;
             const actorId = actor && actor.id;
-            if (groupId && actorId) {
-              pfbidMap.set(`group:${groupId}:${actorId}`, target);
+            if (actorId) {
+              if (groupIdFromUrl) {
+                pfbidMap.set(`group:${groupIdFromUrl}:${actorId}`, target);
+              }
+              if (numericGroupId && numericGroupId !== groupIdFromUrl) {
+                pfbidMap.set(`group:${numericGroupId}:${actorId}`, target);
+              }
             }
           }
         }
@@ -153,6 +174,24 @@ window.__fbsrReport = window.__fbsrReport || [];
     }
   }
 
+  // Expose for fbsrMain to call when it parses inline server-rendered scripts.
+  // Pass an already-parsed object (not text); fires the map-update callback
+  // afterwards if entries were added.
+  window.__fbsrIndexObject = function (obj) {
+    const beforeSize = pfbidMap.size;
+    try {
+      indexResponseForPfbids(obj);
+      indexShareCountsFromEdges(obj);
+    } catch (e) { /* ignore */ }
+    if (pfbidMap.size > beforeSize) {
+      const cb = window.__fbsrOnMapUpdate;
+      if (typeof cb === 'function') {
+        try { cb(); } catch (e) { /* ignore */ }
+      }
+    }
+    return pfbidMap.size - beforeSize;
+  };
+
   try {
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
@@ -160,18 +199,40 @@ window.__fbsrReport = window.__fbsrReport || [];
       this.__fbsrUrl = url;
       return origOpen.apply(this, arguments);
     };
-    XMLHttpRequest.prototype.send = function () {
+    XMLHttpRequest.prototype.send = function (body) {
       const xhr = this;
+      // When debug is enabled, stash the request body so the load handler
+      // can extract the friendly name for window.__feedBodies entries.
+      if (window.__FBSR_DEBUG) xhr.__fbsrSentBody = body;
       if (xhr.__fbsrUrl && String(xhr.__fbsrUrl).indexOf('/api/graphql') !== -1) {
         xhr.addEventListener('load', function () {
           if (xhr.status === 200 && xhr.responseText) {
             try { processBody(xhr.responseText); } catch (e) { /* ignore */ }
+            // Debug-only: keep raw bodies indexed by friendly name so step-2
+            // / step-3 diagnostics can search them without reinstalling a
+            // capture each session.
+            if (window.__FBSR_DEBUG) {
+              try {
+                if (!window.__feedBodies) window.__feedBodies = [];
+                let friendlyName = '?';
+                try {
+                  friendlyName = new URLSearchParams(xhr.__fbsrSentBody || '').get('fb_api_req_friendly_name') || '?';
+                } catch (e) { /* ignore */ }
+                // Cap to avoid unbounded growth in long sessions.
+                if (window.__feedBodies.length >= 50) window.__feedBodies.shift();
+                window.__feedBodies.push({
+                  friendlyName,
+                  size: xhr.responseText.length,
+                  text: xhr.responseText,
+                });
+              } catch (e) { /* ignore */ }
+            }
           }
         });
       }
       return origSend.apply(this, arguments);
     };
-    console.log('[FBSR] pfbid intercept installed (XHR)');
+    console.log('[FBSR] pfbid intercept installed (XHR)' + (window.__FBSR_DEBUG ? ' [debug body capture enabled]' : ''));
   } catch (e) {
     console.warn('[FBSR] pfbid intercept failed:', e);
   }
@@ -481,6 +542,31 @@ function fbsrMain() {
       log('skipping article (comment/reply):', aria.slice(0, 60));
       return null;
     }
+    // 0. Standalone-page short-circuit: on /watch?v=<id>, /photo?fbid=<id>,
+    //    or /reel/<id>/ the URL itself carries the feedback target. The DOM
+    //    of these pages doesn't expose a pfbid or a numeric id we can match
+    //    against the map, so use the URL directly. There's only one post per
+    //    page so we don't need to discriminate between containers.
+    const path = location.pathname;
+    if (path.startsWith('/watch')) {
+      const v = new URLSearchParams(location.search).get('v');
+      if (v) {
+        log(`watch page: feedback target = ${v}`);
+        return v;
+      }
+    } else if (path.startsWith('/photo')) {
+      const fbid = new URLSearchParams(location.search).get('fbid');
+      if (fbid) {
+        log(`photo page: feedback target = ${fbid}`);
+        return fbid;
+      }
+    } else if (path.startsWith('/reel/')) {
+      const reelId = path.match(/^\/reel\/(\d+)/);
+      if (reelId) {
+        log(`reel page: feedback target = ${reelId[1]}`);
+        return reelId[1];
+      }
+    }
     const html = article.outerHTML;
     // 1. DOM scrape: pfbid in the rendered timestamp link.
     const m = html.match(/pfbid[A-Za-z0-9]+/);
@@ -532,8 +618,49 @@ function fbsrMain() {
   let postCounter = 0;
 
   const retryScheduled = new WeakSet();
+  const hydrationObserved = new WeakSet();
 
   function setupPfbidRetry(article, postIdx) {
+    // Per-article MutationObserver: re-run processPost the moment a pfbid
+    // shows up anywhere in the article's subtree. This catches the "hover
+    // the timestamp" case and the "open then close the post" case, where
+    // FB hydrates the pfbid lazily after we've already given up.
+    if (!hydrationObserved.has(article)) {
+      hydrationObserved.add(article);
+      let triggered = false;
+      const mo = new MutationObserver(() => {
+        if (triggered) return;
+        // Check if a pfbid appeared OUTSIDE any blockquote (attached_story)
+        // subtree. Hovering the embedded original also hydrates a pfbid into
+        // the reshare's DOM — but inside a blockquote. We only want to
+        // re-trigger for the RESHARE's own pfbid appearing in the header.
+        const hasOuterPfbid = (() => {
+          const anchors = article.querySelectorAll('a[href*="pfbid"]');
+          for (const a of anchors) {
+            let p = a.parentElement;
+            let inBlockquote = false;
+            while (p && p !== article) {
+              if (p.tagName === 'BLOCKQUOTE') { inBlockquote = true; break; }
+              p = p.parentElement;
+            }
+            if (!inBlockquote) return true;
+          }
+          // Also check group post URL (not pfbid-based)
+          return /\/groups\/[^/]+\/posts\/\d+/.test(article.outerHTML);
+        })();
+        if (hasOuterPfbid) {
+          triggered = true;
+          mo.disconnect();
+          log(`hydration #${postIdx}: outer pfbid detected in DOM, re-running processPost`);
+          processed.delete(article);
+          processPost(article);
+        }
+      });
+      mo.observe(article, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+    }
+
+    // Also keep the viewport-based fallback for slow networks where pfbid
+    // arrives via a future XHR rather than a DOM mutation.
     if (retryScheduled.has(article)) return;
     retryScheduled.add(article);
 
@@ -615,6 +742,9 @@ function fbsrMain() {
     link.className = 'fbsr-link';
     link.href = '#';
     link.textContent = count === 1 ? '1 share' : `${count} shares`;
+    // Store the resolved pfbid so the recycling detector can verify the
+    // link still belongs to the right post after FB reuses the DOM node.
+    link.dataset.fbsrPfbid = String(pfbid);
     let tooltipEl = null;
     let hoverTimer = null;
     // Lazy: tooltipData is null until first hover triggers a fetch. If we
@@ -642,6 +772,14 @@ function fbsrMain() {
 
     function showTooltip() {
       if (tooltipEl) return;
+      // Guard: if the mouse already left the link by the time the 300ms
+      // delay elapsed, don't show. (Can happen if the user clicked the link
+      // or clicked the underlying post which opens FB's own modal, both of
+      // which take focus away before mouseleave fires reliably.)
+      if (!link.matches(':hover')) {
+        log(`tooltip #${postIdx}: cancelled (link no longer hovered)`);
+        return;
+      }
       log(`tooltip #${postIdx}: showing`);
       tooltipEl = document.createElement('div');
       tooltipEl.className = 'fbsr-tooltip';
@@ -658,11 +796,54 @@ function fbsrMain() {
       }
       document.body.appendChild(tooltipEl);
       positionTooltip(tooltipEl, link);
+
+      // Safety net: dismiss the tooltip if the user clicks anywhere or if
+      // the document becomes hidden (e.g., FB's own modal takes over). Use
+      // capture phase so we run even if FB stops propagation.
+      const dismissOnClick = (e) => {
+        if (!tooltipEl || tooltipEl.contains(e.target) || link.contains(e.target)) return;
+        hideTooltip();
+      };
+      const dismissOnVisibility = () => { hideTooltip(); };
+      const dismissOnScroll = () => { hideTooltip(); };
+      const dismissOnEsc = (e) => { if (e.key === 'Escape') hideTooltip(); };
+      // Watchdog: every 500ms, check whether the link is still visible. If
+      // FB has covered it with a modal/dialog, dismiss the tooltip.
+      const watchdog = setInterval(() => {
+        if (!tooltipEl) { clearInterval(watchdog); return; }
+        const rect = link.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        // Off-screen or zero-size → the link's container is gone.
+        if (rect.width === 0 || rect.height === 0 ||
+            cy < 0 || cy > window.innerHeight ||
+            cx < 0 || cx > window.innerWidth) {
+          hideTooltip();
+          return;
+        }
+        // Something else is on top of the link → likely a FB modal.
+        const elAtPoint = document.elementFromPoint(cx, cy);
+        if (elAtPoint && !link.contains(elAtPoint) && !elAtPoint.contains(link)) {
+          hideTooltip();
+        }
+      }, 500);
+      document.addEventListener('click', dismissOnClick, true);
+      document.addEventListener('visibilitychange', dismissOnVisibility);
+      document.addEventListener('keydown', dismissOnEsc, true);
+      window.addEventListener('scroll', dismissOnScroll, { passive: true });
+      tooltipEl.__cleanup = () => {
+        clearInterval(watchdog);
+        document.removeEventListener('click', dismissOnClick, true);
+        document.removeEventListener('visibilitychange', dismissOnVisibility);
+        document.removeEventListener('keydown', dismissOnEsc, true);
+        window.removeEventListener('scroll', dismissOnScroll);
+      };
     }
 
     function hideTooltip() {
       if (tooltipEl) {
         log(`tooltip #${postIdx}: hiding`);
+        try { tooltipEl.__cleanup?.(); } catch {}
         tooltipEl.remove();
         tooltipEl = null;
       }
@@ -670,7 +851,20 @@ function fbsrMain() {
 
     link.addEventListener('mouseenter', () => {
       clearTimeout(hoverTimer);
-      hoverTimer = setTimeout(showTooltip, 300);
+      // Cancel the pending tooltip if the user clicks ANYWHERE before the
+      // 300ms delay elapses — likely they clicked the underlying post (which
+      // opens FB's own lightbox) and we don't want our tooltip to materialize
+      // afterwards. Capture phase + once so we don't accumulate listeners.
+      const onClickDuringWait = () => {
+        clearTimeout(hoverTimer);
+        hoverTimer = null;
+        document.removeEventListener('click', onClickDuringWait, true);
+      };
+      document.addEventListener('click', onClickDuringWait, true);
+      hoverTimer = setTimeout(() => {
+        document.removeEventListener('click', onClickDuringWait, true);
+        showTooltip();
+      }, 300);
     });
     link.addEventListener('mouseleave', () => {
       clearTimeout(hoverTimer);
@@ -679,7 +873,9 @@ function fbsrMain() {
 
     link.addEventListener('click', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       log(`link #${postIdx}: clicked, opening modal`);
+      clearTimeout(hoverTimer);
       hideTooltip();
       openModal(pfbid, count);
     });
@@ -1122,9 +1318,17 @@ function fbsrMain() {
     // The post container is the nearest ancestor that contains the message and the action row.
     const shareButtons = root.querySelectorAll('[data-ad-rendering-role="share_button"]');
     const containers = new Set();
+    // Detect watch/photo pages — they don't have story_message, only a share
+    // button next to an action row. On these pages we treat the share button's
+    // immediate action-row ancestor as the container.
+    const isStandalonePage =
+      location.pathname.startsWith('/watch') ||
+      location.pathname.startsWith('/photo') ||
+      location.pathname.startsWith('/reel/');
     shareButtons.forEach(sb => {
       // Walk up until we find an element that ALSO contains a story_message
       let el = sb;
+      let foundFeedContainer = false;
       for (let i = 0; i < 15 && el; i++) {
         el = el.parentElement;
         if (!el) break;
@@ -1132,7 +1336,27 @@ function fbsrMain() {
           el.querySelector('[data-ad-preview="message"]') ||
           el.querySelector('[aria-label^="Actions for this post"]')) {
           containers.add(el);
+          foundFeedContainer = true;
           break;
+        }
+      }
+      // Standalone-page fallback: action row is the share button's nearest
+      // ancestor that also contains a like or comment button. There's no
+      // story_message on these pages, so we use the action row itself as the
+      // container — it has enough room to inject the link and the URL gives
+      // us the feedback target.
+      if (!foundFeedContainer && isStandalonePage) {
+        let cur = sb;
+        for (let i = 0; i < 6 && cur; i++) {
+          cur = cur.parentElement;
+          if (!cur) break;
+          // An action row typically contains Like + Comment + Share.
+          const looksLikeActionRow =
+            cur.querySelectorAll('[role="button"][aria-label]').length >= 2;
+          if (looksLikeActionRow) {
+            containers.add(cur);
+            break;
+          }
         }
       }
     });
@@ -1176,6 +1400,57 @@ function fbsrMain() {
     }
   });
 
+  // Parse FB's server-rendered inline <script> blocks to extract post data
+  // for the first batch of posts shown on page load. These posts don't come
+  // through XHR, so without this seeding the intercept never sees them and
+  // their pfbids stay invisible to us until the user hovers.
+  //
+  // FB wraps the data in a structure like:
+  //   { require: [["ScheduledServerJS","handle",null,[{__bbox:{...,require:[
+  //     ["RelayPrefetchedStreamCache","next",[],[<token>, {__bbox:{
+  //       complete:true, result:{data:{viewer:{news_feed:{edges:[...]}}}}
+  //     }}]]
+  //   ]}}]]] }
+  // We don't try to match that exact path — we just parse each candidate
+  // script as JSON, then let indexResponseForPfbids walk the whole tree
+  // (it already finds post_id + wwwURL/permalink_url shapes wherever they
+  // live).
+  function seedFromInlineScripts() {
+    // Toggleable: set window.__FBSR_DISABLE_SEEDING = true in console to skip.
+    if (window.__FBSR_DISABLE_SEEDING) {
+      log('seedFromInlineScripts: disabled via flag, skipping');
+      return;
+    }
+    if (typeof window.__fbsrIndexObject !== 'function') return;
+    let scriptsScanned = 0, scriptsParsed = 0, totalAdded = 0;
+    const scripts = document.querySelectorAll('script:not([src])');
+    for (const s of scripts) {
+      const txt = s.textContent;
+      // Pre-filter: only scan scripts that obviously contain post data.
+      if (!txt || txt.length < 1000) continue;
+      if (txt.indexOf('post_id') === -1) continue;
+      if (txt.indexOf('pfbid') === -1 && txt.indexOf('permalink_url') === -1) continue;
+      scriptsScanned++;
+      let obj;
+      try {
+        obj = JSON.parse(txt);
+        scriptsParsed++;
+      } catch (e) {
+        continue; // not valid JSON (e.g. raw JS init code) — skip silently
+      }
+      try {
+        const added = window.__fbsrIndexObject(obj);
+        if (added) totalAdded += added;
+      } catch (e) { /* ignore per-script errors */ }
+    }
+    log(`seedFromInlineScripts: scanned=${scriptsScanned} parsed=${scriptsParsed} added=${totalAdded}`);
+  }
+
+  // Seed once at startup. Schedule a second pass shortly after — FB sometimes
+  // streams additional <script> blocks into the document during initial render.
+  setTimeout(seedFromInlineScripts, 100);
+  setTimeout(seedFromInlineScripts, 2000);
+
   observer.observe(document.body, { childList: true, subtree: true });
   log('observer: attached to document.body');
 
@@ -1185,6 +1460,9 @@ function fbsrMain() {
       log('URL changed:', lastUrl, '→', location.href);
       lastUrl = location.href;
       cachedSlug = null;
+      // Re-seed from any newly-rendered inline scripts after navigation, and
+      // re-scan posts. Delay gives FB time to swap content in for SPA nav.
+      setTimeout(seedFromInlineScripts, 600);
       setTimeout(scanExistingPosts, 500);
     }
   }, 1000);
