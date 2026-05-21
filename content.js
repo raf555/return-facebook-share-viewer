@@ -1,144 +1,116 @@
 // FB Share Revealer — content script
-// Scope: runs only on the logged-in user's own profile page.
-// For each post on that page with shares > 0, injects a "N shares" link.
-// Hover → tooltip with first sharers. Click → modal with all visible sharers.
+// MV3, world: MAIN, run_at: document_start
+// Injects a "N shares" link on every FB post with shares.
+// Hover → tooltip preview. Click → paginated modal of sharers.
 
-window.__fbsrReport = window.__fbsrReport || [];
+// ─── Debug flag ───────────────────────────────────────────────────────────────
+// true  → logs to console + captures graphql responses into window.__feedBodies
+// false → silent
+window.__FBSR_DEBUG = false;
 
-// Debug switch shared between the document_start intercept and fbsrMain.
-// When true:
-//   - Captures every /api/graphql/ response body into window.__feedBodies
-//     so you can run diagnostics without re-installing a capture each time.
-//   - Logs are enabled in fbsrMain (the local DEBUG inside fbsrMain mirrors
-//     this — set both to false for quiet operation).
-window.__FBSR_DEBUG = true;
+// ─── Network intercept ────────────────────────────────────────────────────────
+// Runs at document_start before FB's own scripts. Patches XHR to read every
+// /api/graphql/ response and build two maps:
+//   __fbsrPfbidMap     : various IDs → feedback target (pfbid or numeric post id)
+//   __fbsrShareCountMap: feedback target → cached share count
+(function installIntercept() {
+  if (window.__fbsrPfbidMap) return;
 
-// =============================================================
-// PFBID NETWORK INTERCEPT (runs at document_start, before FB code)
-// Patches XMLHttpRequest to read /api/graphql/ responses, extracts
-// reshare pfbids and indexes them by post_id, attached media id, and
-// attached_story.post_id. Later, getPostPfbid() falls back to this map
-// for posts whose pfbid hasn't been hydrated into the DOM yet.
-// =============================================================
-(function installPfbidIntercept() {
-  if (window.__fbsrPfbidMap) return; // already installed
   const pfbidMap = new Map();
-  const shareCountMap = new Map(); // pfbid -> share count (number)
+  const shareCountMap = new Map();
   window.__fbsrPfbidMap = pfbidMap;
   window.__fbsrShareCountMap = shareCountMap;
 
-  // Walks a top-level post object to find its share_count.count buried under
-  // comet_sections/feedback/.../comet_ufi_summary_and_actions_renderer/feedback.
-  // Avoids descending into attached_story so we don't pick up the original
-  // post's count when this is a reshare.
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  // Given a post-shaped object, return its feedback target or null.
+  // Accepts pfbid (from wwwURL or permalink_url) or a numeric group post id.
+  function extractTarget(obj) {
+    const www = obj.wwwURL;
+    if (typeof www === 'string') {
+      const m = www.match(/pfbid[A-Za-z0-9]+/);
+      if (m) return m[0];
+    }
+    const pl = obj.permalink_url;
+    if (typeof pl === 'string') {
+      const m = pl.match(/pfbid[A-Za-z0-9]+/);
+      if (m) return m[0];
+      const g = pl.match(/\/groups\/[^/]+\/posts\/(\d+)/);
+      if (g) return g[1];
+    }
+    return null;
+  }
+
+  // Walk the share_count field, skipping attached_story to avoid picking up
+  // the original post's count when this object is a reshare.
   function findShareCount(o) {
     if (!o || typeof o !== 'object') return null;
     if (o.share_count && typeof o.share_count.count === 'number') return o.share_count.count;
     for (const k in o) {
       if (k === 'attached_story') continue;
-      const v = o[k];
-      if (v && typeof v === 'object') {
-        const found = findShareCount(v);
-        if (found !== null) return found;
-      }
+      const r = findShareCount(o[k]);
+      if (r !== null) return r;
     }
     return null;
   }
 
-  // Treats the indexed value as a "feedback target" rather than strictly a
-  // pfbid. For regular posts this is the pfbid extracted from wwwURL or
-  // permalink_url (newer responses sometimes omit wwwURL entirely). For
-  // group posts (which don't have pfbids) it's the numeric post_id from
-  // the permalink like /groups/<g>/posts/<numeric>/. Both forms are valid
-  // feedbackTargetID values for the tooltip and dialog queries.
-  function extractFeedbackTarget(obj) {
-    // 1. Pfbid in wwwURL (older shape — profile timeline query)
-    if (typeof obj.wwwURL === 'string' && obj.wwwURL.indexOf('pfbid') !== -1) {
-      const m = obj.wwwURL.match(/pfbid[A-Za-z0-9]+/);
-      if (m) return m[0];
-    }
-    // 2. Pfbid in permalink_url (newer shape — news feed pagination query)
-    if (typeof obj.permalink_url === 'string' && obj.permalink_url.indexOf('pfbid') !== -1) {
-      const m = obj.permalink_url.match(/pfbid[A-Za-z0-9]+/);
-      if (m) return m[0];
-    }
-    // 3. Group post: numeric id in /groups/<g>/posts/<numeric>/
-    if (typeof obj.permalink_url === 'string') {
-      const gm = obj.permalink_url.match(/\/groups\/[^/]+\/posts\/(\d+)/);
-      if (gm) return gm[1];
-    }
-    return null;
-  }
-
-  function indexResponseForPfbids(obj, insideAttachedStory) {
+  // Recursively index post objects. insideAttachedStory prevents us from
+  // treating the embedded original's IDs as keys for the outer reshare.
+  function indexResponse(obj, insideAttachedStory) {
     if (!obj || typeof obj !== 'object') return;
+
     if (!insideAttachedStory && typeof obj.post_id === 'string') {
-      const target = extractFeedbackTarget(obj);
+      const target = extractTarget(obj);
       if (target) {
         pfbidMap.set(obj.post_id, target);
-        if (Array.isArray(obj.attachments)) {
-          for (const att of obj.attachments) {
-            if (!att) continue;
-            if (att.media && att.media.id) pfbidMap.set(att.media.id, target);
-            if (att.target && att.target.id) pfbidMap.set(att.target.id, target);
+
+        // Attachment IDs: lets us resolve posts whose DOM only exposes a media id
+        for (const att of (obj.attachments || [])) {
+          if (!att) continue;
+          if (att.media && att.media.id) pfbidMap.set(att.media.id, target);
+          if (att.target && att.target.id) pfbidMap.set(att.target.id, target);
+        }
+
+        // Group composite key "group:<groupId>:<actorId>":
+        // needed when the DOM only exposes /groups/<id>/user/<uid>/ links.
+        const pl = obj.permalink_url;
+        if (typeof pl === 'string' && /\/groups\/[^/]+\/posts\/\d+/.test(pl)) {
+          const actorId = obj.actors && obj.actors[0] && obj.actors[0].id;
+          if (actorId) {
+            const slugId = (pl.match(/\/groups\/([^/]+)\//) || [])[1];
+            const numericId = obj.feedback &&
+              obj.feedback.associated_group &&
+              obj.feedback.associated_group.id;
+            if (slugId) pfbidMap.set(`group:${slugId}:${actorId}`, target);
+            if (numericId && numericId !== slugId) pfbidMap.set(`group:${numericId}:${actorId}`, target);
           }
         }
-        // Group post: build "group:<id>:<actorId>" composite keys. The DOM
-        // of a group post doesn't expose the post_id directly — only the
-        // group link and the poster's profile link. Last-write-wins means
-        // we only cover the most recent post by an actor in a group, which
-        // is acceptable for feed scans.
-        //
-        // FB serves groups by both vanity slug and numeric id. The
-        // permalink_url uses whichever the group was navigated by (often the
-        // vanity), but the DOM's user-link uses the numeric form. So we
-        // index BOTH variants whenever we can find them.
-        if (typeof obj.permalink_url === 'string') {
-          const gm = obj.permalink_url.match(/\/groups\/[^/]+\/posts\/\d+/);
-          if (gm) {
-            const groupIdMatch = obj.permalink_url.match(/\/groups\/([^/]+)\//);
-            const groupIdFromUrl = groupIdMatch && groupIdMatch[1];
-            // Numeric group id lives on feedback.associated_group.id — usable
-            // even when the permalink uses a vanity slug.
-            const numericGroupId =
-              obj.feedback && obj.feedback.associated_group && obj.feedback.associated_group.id;
-            const actor = Array.isArray(obj.actors) ? obj.actors[0] : null;
-            const actorId = actor && actor.id;
-            if (actorId) {
-              if (groupIdFromUrl) {
-                pfbidMap.set(`group:${groupIdFromUrl}:${actorId}`, target);
-              }
-              if (numericGroupId && numericGroupId !== groupIdFromUrl) {
-                pfbidMap.set(`group:${numericGroupId}:${actorId}`, target);
-              }
-            }
-          }
-        }
-        if (obj.attached_story) {
-          if (obj.attached_story.post_id && !pfbidMap.has(obj.attached_story.post_id)) {
-            pfbidMap.set(obj.attached_story.post_id, target);
-          }
+
+        // No-overwrite: index attached_story's own post_id pointing back to the
+        // reshare's target only if that slot is unclaimed (first-seen wins).
+        if (obj.attached_story && obj.attached_story.post_id &&
+          !pfbidMap.has(obj.attached_story.post_id)) {
+          pfbidMap.set(obj.attached_story.post_id, target);
         }
       }
     }
+
     for (const k in obj) {
       const v = obj[k];
       if (v && typeof v === 'object') {
-        indexResponseForPfbids(v, insideAttachedStory || k === 'attached_story');
+        indexResponse(v, insideAttachedStory || k === 'attached_story');
       }
     }
   }
 
-  // Second pass: walk top-level feed edges to associate share_count with
-  // the post's feedback target. Done separately so we don't blow up the
-  // recursive indexer with extra logic.
-  function indexShareCountsFromEdges(obj) {
+  // Walk feed edges to index share counts via comet_sections.
+  function indexShareCounts(obj) {
     if (!obj || typeof obj !== 'object') return;
     function visit(node) {
       if (!node || typeof node !== 'object') return;
-      const story = node?.comet_sections?.content?.story;
+      const story = node.comet_sections && node.comet_sections.content && node.comet_sections.content.story;
       if (story && typeof story.post_id === 'string') {
-        const target = extractFeedbackTarget(story) || extractFeedbackTarget(node);
+        const target = extractTarget(story) || extractTarget(node);
         if (target) {
           const count = findShareCount(node.comet_sections);
           if (count !== null) shareCountMap.set(target, count);
@@ -146,819 +118,509 @@ window.__FBSR_DEBUG = true;
       }
       for (const k in node) {
         if (k === 'attached_story') continue;
-        const v = node[k];
-        if (v && typeof v === 'object') visit(v);
+        if (node[k] && typeof node[k] === 'object') visit(node[k]);
       }
     }
     visit(obj);
   }
 
-  function processBody(text) {
-    if (!text || text.indexOf('pfbid') === -1 && text.indexOf('/groups/') === -1) return;
-    const beforeSize = pfbidMap.size;
+  function onGraphQLResponse(text) {
+    if (!text || (text.indexOf('pfbid') === -1 && text.indexOf('/groups/') === -1)) return;
+    const before = pfbidMap.size;
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
       try {
-        const parsed = JSON.parse(line);
-        indexResponseForPfbids(parsed);
-        indexShareCountsFromEdges(parsed);
+        const obj = JSON.parse(line);
+        indexResponse(obj, false);
+        indexShareCounts(obj);
       } catch (e) { /* ignore */ }
     }
-    // Notify any listener that new entries have been indexed. The main script
-    // uses this to re-scan posts that didn't have a pfbid on first pass.
-    if (pfbidMap.size > beforeSize) {
+    if (pfbidMap.size > before) {
       const cb = window.__fbsrOnMapUpdate;
-      if (typeof cb === 'function') {
-        try { cb(); } catch (e) { /* ignore */ }
-      }
+      if (typeof cb === 'function') try { cb(); } catch (e) { /* ignore */ }
     }
   }
 
-  // Expose for fbsrMain to call when it parses inline server-rendered scripts.
-  // Pass an already-parsed object (not text); fires the map-update callback
-  // afterwards if entries were added.
+  // Exposed for inline-script seeding from fbsrMain
   window.__fbsrIndexObject = function (obj) {
-    const beforeSize = pfbidMap.size;
-    try {
-      indexResponseForPfbids(obj);
-      indexShareCountsFromEdges(obj);
-    } catch (e) { /* ignore */ }
-    if (pfbidMap.size > beforeSize) {
+    const before = pfbidMap.size;
+    try { indexResponse(obj, false); indexShareCounts(obj); } catch (e) { /* ignore */ }
+    const added = pfbidMap.size - before;
+    if (added > 0) {
       const cb = window.__fbsrOnMapUpdate;
-      if (typeof cb === 'function') {
-        try { cb(); } catch (e) { /* ignore */ }
-      }
+      if (typeof cb === 'function') try { cb(); } catch (e) { /* ignore */ }
     }
-    return pfbidMap.size - beforeSize;
+    return added;
   };
 
-  try {
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (method, url) {
-      this.__fbsrUrl = url;
-      return origOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.send = function (body) {
-      const xhr = this;
-      // When debug is enabled, stash the request body so the load handler
-      // can extract the friendly name for window.__feedBodies entries.
-      if (window.__FBSR_DEBUG) xhr.__fbsrSentBody = body;
-      if (xhr.__fbsrUrl && String(xhr.__fbsrUrl).indexOf('/api/graphql') !== -1) {
-        xhr.addEventListener('load', function () {
-          if (xhr.status === 200 && xhr.responseText) {
-            try { processBody(xhr.responseText); } catch (e) { /* ignore */ }
-            // Debug-only: keep raw bodies indexed by friendly name so step-2
-            // / step-3 diagnostics can search them without reinstalling a
-            // capture each session.
-            if (window.__FBSR_DEBUG) {
-              try {
-                if (!window.__feedBodies) window.__feedBodies = [];
-                let friendlyName = '?';
-                try {
-                  friendlyName = new URLSearchParams(xhr.__fbsrSentBody || '').get('fb_api_req_friendly_name') || '?';
-                } catch (e) { /* ignore */ }
-                // Cap to avoid unbounded growth in long sessions.
-                if (window.__feedBodies.length >= 50) window.__feedBodies.shift();
-                window.__feedBodies.push({
-                  friendlyName,
-                  size: xhr.responseText.length,
-                  text: xhr.responseText,
-                });
-              } catch (e) { /* ignore */ }
-            }
-          }
-        });
-      }
-      return origSend.apply(this, arguments);
-    };
-    console.log('[FBSR] pfbid intercept installed (XHR)' + (window.__FBSR_DEBUG ? ' [debug body capture enabled]' : ''));
-  } catch (e) {
-    console.warn('[FBSR] pfbid intercept failed:', e);
-  }
+  // ── XHR patch ───────────────────────────────────────────────────────────────
+  const origOpen = XMLHttpRequest.prototype.open;
+  const origSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__fbsrUrl = url;
+    return origOpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function (body) {
+    if (window.__FBSR_DEBUG) this.__fbsrSentBody = body;
+    if (this.__fbsrUrl && String(this.__fbsrUrl).indexOf('/api/graphql') !== -1) {
+      this.addEventListener('load', () => {
+        if (this.status !== 200 || !this.responseText) return;
+        try { onGraphQLResponse(this.responseText); } catch (e) { /* ignore */ }
+        if (window.__FBSR_DEBUG) {
+          try {
+            if (!window.__feedBodies) window.__feedBodies = [];
+            let name = '?';
+            try { name = new URLSearchParams(this.__fbsrSentBody || '').get('fb_api_req_friendly_name') || '?'; } catch (e) { /* ignore */ }
+            if (window.__feedBodies.length >= 50) window.__feedBodies.shift();
+            window.__feedBodies.push({ friendlyName: name, size: this.responseText.length, text: this.responseText });
+          } catch (e) { /* ignore */ }
+        }
+      });
+    }
+    return origSend.apply(this, arguments);
+  };
+
+  console.log('[FBSR] intercept installed' + (window.__FBSR_DEBUG ? ' [debug]' : ''));
 })();
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
 function fbsrMain() {
-  'use strict';
+  const DEBUG = window.__FBSR_DEBUG;
+  const log = (...a) => { if (DEBUG) console.log('[FBSR]', ...a); };
+  const warn = (...a) => { if (DEBUG) console.warn('[FBSR]', ...a); };
+  const err = (...a) => { console.error('[FBSR]', ...a); };
 
-  // Set to false to enable the extension on every FB page (groups, news feed,
-  // other users' profiles, etc.). When true, runs only on the logged-in
-  // user's own profile, matching the original scope. The intercept above
-  // runs regardless of this flag.
-  const RESTRICT_TO_OWN_PROFILE = false;
+  // ── Tokens ──────────────────────────────────────────────────────────────────
+  let tokens = null;
 
-  // ============================================================
-  // Debug logging
-  // ============================================================
-  const DEBUG = true;
-  const LOG_PREFIX = '[FBSR]';
-
-  function log(...args) {
-    if (DEBUG) console.log(LOG_PREFIX, ...args);
-  }
-  function warn(...args) {
-    if (DEBUG) console.warn(LOG_PREFIX, ...args);
-  }
-  function err(...args) {
-    if (DEBUG) console.error(LOG_PREFIX, ...args);
-  }
-  function group(label, fn) {
-    if (!DEBUG) return fn();
-    console.groupCollapsed(LOG_PREFIX + ' ' + label);
-    try {
-      return fn();
-    } finally {
-      console.groupEnd();
-    }
-  }
-
-  log('script loaded at', new Date().toISOString(), '| url:', location.href);
-
-  // ============================================================
-  // Token scraping
-  // ============================================================
-
-  function scrapeTokens() {
+  function getTokens() {
+    if (tokens) return tokens;
     const html = document.documentElement.innerHTML;
-    const fbDtsg =
-      html.match(/"DTSGInitData",\[\],\{"token":"([^"]+)"/)?.[1] ||
-      html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/)?.[1] ||
-      html.match(/name="fb_dtsg" value="([^"]+)"/)?.[1];
-    const lsd = html.match(/"LSD",\[\],\{"token":"([^"]+)"/)?.[1];
-    const userId = document.cookie.match(/c_user=(\d+)/)?.[1];
-
-    log('scrapeTokens:', {
-      fbDtsg: fbDtsg ? `${fbDtsg.slice(0, 6)}…(${fbDtsg.length} chars)` : null,
-      lsd: lsd ? `${lsd.slice(0, 6)}…` : null,
-      userId,
-    });
-
+    const fbDtsg = (html.match(/"DTSGInitData",\[\],\{"token":"([^"]+)"/) || [])[1] ||
+      (html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) || [])[1] ||
+      (html.match(/name="fb_dtsg" value="([^"]+)"/) || [])[1];
+    const lsd = (html.match(/"LSD",\[\],\{"token":"([^"]+)"/) || [])[1];
+    const userId = (document.cookie.match(/c_user=(\d+)/) || [])[1];
     if (!fbDtsg || !userId) return null;
     const jazoest = '2' + [...fbDtsg].reduce((s, c) => s + c.charCodeAt(0), 0);
-    return { fbDtsg, lsd: lsd || '', userId, jazoest };
+    tokens = { fbDtsg, lsd: lsd || '', userId, jazoest };
+    return tokens;
   }
 
-  let tokens = scrapeTokens();
-  if (!tokens) {
-    err('Failed to scrape tokens. Are you logged in?');
-    return;
-  }
+  if (!getTokens()) { err('no tokens — are you logged in?'); return; }
 
-  // ============================================================
-  // Profile-page detection
-  // ============================================================
+  // ── GraphQL ─────────────────────────────────────────────────────────────────
 
-  let cachedSlug = null;
-
-  function getOwnSlug() {
-    if (cachedSlug) {
-      log('getOwnSlug: using cached slug:', cachedSlug);
-      return cachedSlug;
-    }
-
-    return group('getOwnSlug — scanning for slug', () => {
-      // Strategy 1: anchors that include profile.php?id=<userId>
-      const numericAnchors = document.querySelectorAll(
-        `a[href*="profile.php?id=${tokens.userId}"]`
-      );
-      log(`Strategy 1: found ${numericAnchors.length} numeric-id anchors`);
-
-      // Strategy 2: if the URL slug matches the (sole or any) "vanity" field in HTML, it's ours
-      const html = document.documentElement.innerHTML;
-      const vanities = [...html.matchAll(/"vanity":"([^"]+)"/g)].map(m => m[1]);
-      log(`Strategy 2: found ${vanities.length} vanity field(s) in HTML:`, vanities);
-      const urlSlugMatch = location.pathname.match(/^\/([^\/\?#]+)(?:\/|$)/);
-      const urlSlug = urlSlugMatch && urlSlugMatch[1] !== 'profile.php' ? urlSlugMatch[1] : null;
-      if (urlSlug && vanities.includes(urlSlug)) {
-        log('Strategy 2: URL slug matches a vanity in HTML →', urlSlug);
-        cachedSlug = urlSlug;
-        return cachedSlug;
-      }
-
-      // Strategy 3: scan labeled anchors for "Your profile" type aria
-      const labeledAnchors = [...document.querySelectorAll('a[aria-label][href]')];
-      log(`Strategy 3: scanning ${labeledAnchors.length} labeled anchors`);
-      for (const a of labeledAnchors) {
-        const aria = (a.getAttribute('aria-label') || '').toLowerCase();
-        const href = a.getAttribute('href') || '';
-        if (aria.includes('your profile')) {
-          const m = href.match(/^\/([^\/\?#]+)(?:\/|\?|$)/);
-          if (m && m[1] !== 'profile.php') {
-            log('Strategy 3: matched aria "your profile" →', m[1]);
-            cachedSlug = m[1];
-            return cachedSlug;
-          }
-        }
-      }
-
-      // Strategy 4: "Edit profile" button visible → URL slug is ours
-      const editProfileBtn = [
-        ...document.querySelectorAll('div[role="button"], a[role="button"]'),
-      ].find(
-        (b) =>
-          /edit profile/i.test(b.textContent || '') ||
-          /edit profile/i.test(b.getAttribute('aria-label') || '')
-      );
-      if (editProfileBtn) {
-        const m = location.pathname.match(/^\/([^\/\?#]+)(?:\/|$)/);
-        if (m && m[1] !== 'profile.php') {
-          log('Strategy 4: "Edit profile" button present → URL slug is ours:', m[1]);
-          cachedSlug = m[1];
-          return cachedSlug;
-        }
-      } else {
-        log('Strategy 4: no "Edit profile" button visible');
-      }
-
-      warn('getOwnSlug: ALL strategies failed');
-      return null;
-    });
-  }
-
-  function isOnOwnProfile() {
-    const path = location.pathname;
-    const search = location.search;
-
-    const idMatch = search.match(/[?&]id=(\d+)/);
-    if (path === '/profile.php' && idMatch && idMatch[1] === tokens.userId) {
-      log('isOnOwnProfile: TRUE (profile.php?id=', tokens.userId, ')');
-      return true;
-    }
-
-    const slug = getOwnSlug();
-    if (!slug) {
-      log('isOnOwnProfile: FALSE (no slug determined)');
-      return false;
-    }
-    const m = path.match(/^\/([^\/]+)(?:\/|$)/);
-    if (!m) {
-      log('isOnOwnProfile: FALSE (path does not look like profile path):', path);
-      return false;
-    }
-    const result = m[1].toLowerCase() === slug.toLowerCase();
-    log(`isOnOwnProfile: ${result ? 'TRUE' : 'FALSE'} (path slug "${m[1]}" vs own "${slug}")`);
-    return result;
-  }
-
-  // ============================================================
-  // GraphQL client
-  // ============================================================
-
-  async function callGraphQL({ friendlyName, docId, variables }) {
-    if (!tokens) tokens = scrapeTokens();
-    if (!tokens) throw new Error('No tokens');
-
-    log(`GraphQL → ${friendlyName}`, { variables });
-
+  async function callGraphQL(friendlyName, docId, variables) {
+    const t = getTokens();
+    if (!t) throw new Error('no tokens');
     const body = new URLSearchParams({
-      av: tokens.userId,
-      __user: tokens.userId,
-      __a: '1',
-      __req: '1',
-      fb_dtsg: tokens.fbDtsg,
-      jazoest: tokens.jazoest,
-      lsd: tokens.lsd,
+      av: t.userId, __user: t.userId, __a: '1', __req: '1',
+      fb_dtsg: t.fbDtsg, jazoest: t.jazoest, lsd: t.lsd,
       fb_api_caller_class: 'RelayModern',
       fb_api_req_friendly_name: friendlyName,
       server_timestamps: 'true',
       variables: JSON.stringify(variables),
       doc_id: docId,
     });
-
     const res = await fetch('https://www.facebook.com/api/graphql/', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded',
-        'x-fb-friendly-name': friendlyName,
-        'x-fb-lsd': tokens.lsd,
-      },
+      method: 'POST', credentials: 'include',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-fb-friendly-name': friendlyName, 'x-fb-lsd': t.lsd },
       body: body.toString(),
     });
     const text = await res.text();
-    const firstChunk = text.replace(/^for \(;;\);/, '').split('\n')[0];
-    const parsed = JSON.parse(firstChunk);
-    log(`GraphQL ← ${friendlyName}`, parsed.errors ? { errors: parsed.errors } : 'ok');
-    return parsed;
+    const json = JSON.parse(text.replace(/^for \(;;\);/, '').split('\n')[0]);
+    log(`← ${friendlyName}`, json.errors ? { errors: json.errors } : 'ok');
+    return json;
   }
 
-  function tooltipQuery(pfbid) {
-    return callGraphQL({
-      friendlyName: 'CometUFISharesCountTooltipContentQuery',
-      docId: '9843821265734688',
-      variables: { feedbackTargetID: pfbid },
+  // Shared relay provider flags (required by FB's query schema)
+  const RELAY_VARS = {
+    __relay_internal__pv__CometFeedStory_enable_reactor_facepilerelayprovider: false,
+    __relay_internal__pv__CometFeedStory_enable_post_permalink_white_space_clickrelayprovider: false,
+    __relay_internal__pv__CometUFICommentActionLinksRewriteEnabledrelayprovider: false,
+    __relay_internal__pv__CometUFICommentAvatarStickerAnimatedImagerelayprovider: false,
+    __relay_internal__pv__IsWorkUserrelayprovider: false,
+    __relay_internal__pv__GHLShouldChangeSponsoredDataFieldNamerelayprovider: true,
+    __relay_internal__pv__TestPilotShouldIncludeDemoAdUseCaserelayprovider: false,
+    __relay_internal__pv__FBReels_deprecate_short_form_video_context_gkrelayprovider: true,
+    __relay_internal__pv__GHLShouldChangeAdIdFieldNamerelayprovider: true,
+    __relay_internal__pv__FBReels_enable_view_dubbed_audio_type_gkrelayprovider: true,
+    __relay_internal__pv__CometFeedShareMedia_shouldPrefetchShareImagerelayprovider: false,
+    __relay_internal__pv__CometImmersivePhotoCanUserDisable3DMotionrelayprovider: false,
+    __relay_internal__pv__WorkCometIsEmployeeGKProviderrelayprovider: false,
+    __relay_internal__pv__IsMergQAPollsrelayprovider: false,
+    __relay_internal__pv__FBReelsMediaFooter_comet_enable_reels_ads_gkrelayprovider: true,
+    __relay_internal__pv__CometUFIReactionsEnableShortNamerelayprovider: false,
+    __relay_internal__pv__CometUFICommentAutoTranslationTyperelayprovider: 'ORIGINAL',
+    __relay_internal__pv__CometUFIShareActionMigrationrelayprovider: true,
+    __relay_internal__pv__CometUFISingleLineUFIrelayprovider: true,
+    __relay_internal__pv__relay_provider_comet_ufi_ssr_seo_deferrelayprovider: true,
+    __relay_internal__pv__CometUFI_dedicated_comment_routable_dialog_gkrelayprovider: true,
+  };
+
+  function queryTooltip(target) {
+    return callGraphQL('CometUFISharesCountTooltipContentQuery', '9843821265734688',
+      { feedbackTargetID: target });
+  }
+
+  function queryDialog(target) {
+    return callGraphQL('CometResharesDialogQuery', '26194058653607577', {
+      count: 10, feedbackID: target, feedbackSource: 1,
+      feedLocation: 'SHARE_OVERLAY', privacySelectorRenderLocation: 'COMET_STREAM',
+      renderLocation: 'reshares_dialog', scale: 1, ...RELAY_VARS,
     });
   }
 
-  // Initial page: fetch first batch of sharers + the feedback base64 id we
-  // need for subsequent paginated requests.
-  function dialogQuery(pfbid, count = 10) {
-    return callGraphQL({
-      friendlyName: 'CometResharesDialogQuery',
-      docId: '26194058653607577',
-      variables: {
-        count,
-        feedbackID: pfbid,
-        feedbackSource: 1,
-        feedLocation: 'SHARE_OVERLAY',
-        privacySelectorRenderLocation: 'COMET_STREAM',
-        renderLocation: 'reshares_dialog',
-        scale: 1,
-        __relay_internal__pv__CometFeedStory_enable_reactor_facepilerelayprovider: false,
-        __relay_internal__pv__CometFeedStory_enable_post_permalink_white_space_clickrelayprovider: false,
-        __relay_internal__pv__CometUFICommentActionLinksRewriteEnabledrelayprovider: false,
-        __relay_internal__pv__CometUFICommentAvatarStickerAnimatedImagerelayprovider: false,
-        __relay_internal__pv__IsWorkUserrelayprovider: false,
-        __relay_internal__pv__GHLShouldChangeSponsoredDataFieldNamerelayprovider: true,
-        __relay_internal__pv__TestPilotShouldIncludeDemoAdUseCaserelayprovider: false,
-        __relay_internal__pv__FBReels_deprecate_short_form_video_context_gkrelayprovider: true,
-        __relay_internal__pv__GHLShouldChangeAdIdFieldNamerelayprovider: true,
-        __relay_internal__pv__FBReels_enable_view_dubbed_audio_type_gkrelayprovider: true,
-        __relay_internal__pv__CometFeedShareMedia_shouldPrefetchShareImagerelayprovider: false,
-        __relay_internal__pv__CometImmersivePhotoCanUserDisable3DMotionrelayprovider: false,
-        __relay_internal__pv__WorkCometIsEmployeeGKProviderrelayprovider: false,
-        __relay_internal__pv__IsMergQAPollsrelayprovider: false,
-        __relay_internal__pv__FBReelsMediaFooter_comet_enable_reels_ads_gkrelayprovider: true,
-        __relay_internal__pv__CometUFIReactionsEnableShortNamerelayprovider: false,
-        __relay_internal__pv__CometUFICommentAutoTranslationTyperelayprovider: 'ORIGINAL',
-        __relay_internal__pv__CometUFIShareActionMigrationrelayprovider: true,
-        __relay_internal__pv__CometUFISingleLineUFIrelayprovider: true,
-        __relay_internal__pv__relay_provider_comet_ufi_ssr_seo_deferrelayprovider: true,
-        __relay_internal__pv__CometUFI_dedicated_comment_routable_dialog_gkrelayprovider: true,
-      },
+  function queryPagination(feedbackBase64Id, cursor) {
+    return callGraphQL('CometResharesFeedPaginationQuery', '36071431812455144', {
+      count: 10, cursor, feedLocation: 'SHARE_OVERLAY', feedbackSource: 1,
+      focusCommentID: null, privacySelectorRenderLocation: 'COMET_STREAM',
+      referringStoryRenderLocation: null, renderLocation: 'reshares_dialog',
+      scale: 1, useDefaultActor: false, id: feedbackBase64Id, ...RELAY_VARS,
     });
   }
 
-  // Subsequent pages: take the base64 feedback `id` from the first response
-  // and a `cursor`. Returns more reshare edges under data.node.reshares.
-  function paginationQuery(feedbackBase64Id, cursor, count = 10) {
-    return callGraphQL({
-      friendlyName: 'CometResharesFeedPaginationQuery',
-      docId: '36071431812455144',
-      variables: {
-        count,
-        cursor,
-        feedLocation: 'SHARE_OVERLAY',
-        feedbackSource: 1,
-        focusCommentID: null,
-        privacySelectorRenderLocation: 'COMET_STREAM',
-        referringStoryRenderLocation: null,
-        renderLocation: 'reshares_dialog',
-        scale: 1,
-        useDefaultActor: false,
-        id: feedbackBase64Id,
-        __relay_internal__pv__CometFeedStory_enable_reactor_facepilerelayprovider: false,
-        __relay_internal__pv__CometFeedStory_enable_post_permalink_white_space_clickrelayprovider: false,
-        __relay_internal__pv__CometUFICommentActionLinksRewriteEnabledrelayprovider: false,
-        __relay_internal__pv__CometUFICommentAvatarStickerAnimatedImagerelayprovider: false,
-        __relay_internal__pv__IsWorkUserrelayprovider: false,
-        __relay_internal__pv__GHLShouldChangeSponsoredDataFieldNamerelayprovider: true,
-        __relay_internal__pv__TestPilotShouldIncludeDemoAdUseCaserelayprovider: false,
-        __relay_internal__pv__FBReels_deprecate_short_form_video_context_gkrelayprovider: true,
-        __relay_internal__pv__GHLShouldChangeAdIdFieldNamerelayprovider: true,
-        __relay_internal__pv__FBReels_enable_view_dubbed_audio_type_gkrelayprovider: true,
-        __relay_internal__pv__CometFeedShareMedia_shouldPrefetchShareImagerelayprovider: false,
-        __relay_internal__pv__CometImmersivePhotoCanUserDisable3DMotionrelayprovider: false,
-        __relay_internal__pv__WorkCometIsEmployeeGKProviderrelayprovider: false,
-        __relay_internal__pv__IsMergQAPollsrelayprovider: false,
-        __relay_internal__pv__FBReelsMediaFooter_comet_enable_reels_ads_gkrelayprovider: true,
-        __relay_internal__pv__CometUFIReactionsEnableShortNamerelayprovider: false,
-        __relay_internal__pv__CometUFICommentAutoTranslationTyperelayprovider: 'ORIGINAL',
-        __relay_internal__pv__CometUFIShareActionMigrationrelayprovider: true,
-        __relay_internal__pv__CometUFISingleLineUFIrelayprovider: true,
-        __relay_internal__pv__relay_provider_comet_ufi_ssr_seo_deferrelayprovider: true,
-        __relay_internal__pv__CometUFI_dedicated_comment_routable_dialog_gkrelayprovider: true,
-      },
-    });
-  }
+  // ── Post identification ──────────────────────────────────────────────────────
+  // Returns a feedback target for the given post container, or null.
 
-  // ============================================================
-  // Post discovery
-  // ============================================================
-
-  function getPostPfbid(article) {
-    const aria = article.getAttribute('aria-label') || '';
-    if (/^(Comment|Reply) by/i.test(aria)) {
-      log('skipping article (comment/reply):', aria.slice(0, 60));
-      return null;
-    }
-    // 0. Standalone-page short-circuit: on /watch?v=<id>, /photo?fbid=<id>,
-    //    or /reel/<id>/ the URL itself carries the feedback target. The DOM
-    //    of these pages doesn't expose a pfbid or a numeric id we can match
-    //    against the map, so use the URL directly. There's only one post per
-    //    page so we don't need to discriminate between containers.
+  function getFeedbackTarget(article) {
+    // Standalone pages: target comes from the URL (one post per page)
     const path = location.pathname;
     if (path.startsWith('/watch')) {
       const v = new URLSearchParams(location.search).get('v');
-      if (v) {
-        log(`watch page: feedback target = ${v}`);
-        return v;
-      }
-    } else if (path.startsWith('/photo')) {
+      if (v) return v;
+    }
+    if (path.startsWith('/photo')) {
       const fbid = new URLSearchParams(location.search).get('fbid');
-      if (fbid) {
-        log(`photo page: feedback target = ${fbid}`);
-        return fbid;
-      }
-    } else if (path.startsWith('/reel/')) {
-      const reelId = path.match(/^\/reel\/(\d+)/);
-      if (reelId) {
-        log(`reel page: feedback target = ${reelId[1]}`);
-        return reelId[1];
-      }
+      if (fbid) return fbid;
     }
+    if (path.startsWith('/reel/')) {
+      const m = path.match(/^\/reel\/(\d+)/);
+      if (m) return m[1];
+    }
+
     const html = article.outerHTML;
-    // 1. DOM scrape: pfbid in the rendered timestamp link.
-    const m = html.match(/pfbid[A-Za-z0-9]+/);
-    if (m) {
-      log('found pfbid via DOM:', m[0].slice(0, 20) + '…');
-      return m[0];
-    }
-    // 2. Group post permalink with explicit post id: /groups/<g>/posts/<numeric>/
-    const gm = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
-    if (gm) {
-      log(`found group post target via DOM: ${gm[1]}`);
-      return gm[1];
-    }
+
+    // 1. pfbid in DOM (simple regex — fast path, works for most posts)
+    const pfbid = html.match(/pfbid[A-Za-z0-9]+/);
+    if (pfbid) return pfbid[0];
+
+    // 2. Group post: explicit numeric id in permalink
+    const groupPost = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
+    if (groupPost) return groupPost[1];
+
     const map = window.__fbsrPfbidMap;
-    if (map && map.size) {
-      // 3. Composite key lookup: some group posts only expose the group link
-      //    and the poster's user link in the DOM (no post id at all). Build
-      //    a "group:<groupId>:<actorId>" key from the DOM and try the map.
-      const groupOnly = html.match(/\/groups\/(\d+)\/user\/(\d+)\//);
-      if (groupOnly) {
-        const compositeKey = `group:${groupOnly[1]}:${groupOnly[2]}`;
-        const target = map.get(compositeKey);
-        if (target) {
-          log(`found target via composite group key: ${compositeKey} -> ${String(target).slice(0, 20)}…`);
-          return target;
-        }
-      }
-      // 4. Map lookup by any long numeric ID in the container.
-      const ids = new Set(html.match(/\b\d{14,20}\b/g) || []);
-      for (const id of ids) {
-        const target = map.get(id);
-        if (target) {
-          log(`found target via map: id=${id} -> ${String(target).slice(0, 20)}…`);
-          return target;
-        }
-      }
-      log(`no target in DOM; tried ${ids.size} ids against map (size ${map.size}), no match`);
-    } else {
-      log('no target found in article, map empty');
+    if (!map || !map.size) return null;
+
+    // 3. Group composite key from /groups/<id>/user/<uid>/ DOM links
+    const groupUser = html.match(/\/groups\/(\d+)\/user\/(\d+)\//);
+    if (groupUser) {
+      const t = map.get(`group:${groupUser[1]}:${groupUser[2]}`);
+      if (t) return t;
     }
+
+    // 4. Any long numeric ID in the DOM matched against pfbidMap
+    for (const id of new Set(html.match(/\b\d{14,20}\b/g) || [])) {
+      const t = map.get(id);
+      if (t) return t;
+    }
+
     return null;
   }
 
-  // ============================================================
-  // Link injection
-  // ============================================================
+  // ── Post containers ──────────────────────────────────────────────────────────
+
+  function findPostContainers(root) {
+    root = root || document;
+    const containers = new Set();
+    const isStandalone = /^\/(watch|photo|reel\/)/.test(location.pathname);
+
+    for (const sb of root.querySelectorAll('[data-ad-rendering-role="share_button"]')) {
+      let el = sb;
+      let found = false;
+      for (let i = 0; i < 15 && el; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        if (el.querySelector('[data-ad-rendering-role="story_message"]') ||
+          el.querySelector('[data-ad-preview="message"]') ||
+          el.querySelector('[aria-label^="Actions for this post"]')) {
+          containers.add(el);
+          found = true;
+          break;
+        }
+      }
+      // Standalone-page fallback: use the action-row ancestor
+      if (!found && isStandalone) {
+        let cur = sb;
+        for (let i = 0; i < 6 && cur; i++) {
+          cur = cur.parentElement;
+          if (!cur) break;
+          if (cur.querySelectorAll('[role="button"][aria-label]').length >= 2) {
+            containers.add(cur);
+            break;
+          }
+        }
+      }
+    }
+    return [...containers];
+  }
+
+  // ── Retry infrastructure ─────────────────────────────────────────────────────
 
   const processed = new WeakSet();
+  const retryScheduled = new WeakSet();
+  const hydrationWatched = new WeakSet();
   let postCounter = 0;
 
-  const retryScheduled = new WeakSet();
-  const hydrationObserved = new WeakSet();
-
-  function setupPfbidRetry(article, postIdx) {
-    // Per-article MutationObserver: re-run processPost the moment a pfbid
-    // shows up anywhere in the article's subtree. This catches the "hover
-    // the timestamp" case and the "open then close the post" case, where
-    // FB hydrates the pfbid lazily after we've already given up.
-    if (!hydrationObserved.has(article)) {
-      hydrationObserved.add(article);
-      let triggered = false;
+  function setupRetry(article, idx) {
+    // MutationObserver: re-run when an outer pfbid hydrates into the DOM.
+    // "Outer" means NOT inside a <blockquote> (the embedded original's wrapper)
+    // so hovering the embedded post doesn't incorrectly trigger re-processing.
+    if (!hydrationWatched.has(article)) {
+      hydrationWatched.add(article);
+      let fired = false;
       const mo = new MutationObserver(() => {
-        if (triggered) return;
-        // Check if a pfbid appeared OUTSIDE any blockquote (attached_story)
-        // subtree. Hovering the embedded original also hydrates a pfbid into
-        // the reshare's DOM — but inside a blockquote. We only want to
-        // re-trigger for the RESHARE's own pfbid appearing in the header.
-        const hasOuterPfbid = (() => {
-          const anchors = article.querySelectorAll('a[href*="pfbid"]');
-          for (const a of anchors) {
-            let p = a.parentElement;
-            let inBlockquote = false;
-            while (p && p !== article) {
-              if (p.tagName === 'BLOCKQUOTE') { inBlockquote = true; break; }
-              p = p.parentElement;
-            }
-            if (!inBlockquote) return true;
-          }
-          // Also check group post URL (not pfbid-based)
-          return /\/groups\/[^/]+\/posts\/\d+/.test(article.outerHTML);
-        })();
-        if (hasOuterPfbid) {
-          triggered = true;
-          mo.disconnect();
-          log(`hydration #${postIdx}: outer pfbid detected in DOM, re-running processPost`);
-          processed.delete(article);
-          processPost(article);
+        if (fired) return;
+        let hasOuterPfbid = false;
+        for (const a of article.querySelectorAll('a[href*="pfbid"]')) {
+          let inBQ = false, p = a.parentElement;
+          while (p && p !== article) { if (p.tagName === 'BLOCKQUOTE') { inBQ = true; break; } p = p.parentElement; }
+          if (!inBQ) { hasOuterPfbid = true; break; }
         }
+        if (!hasOuterPfbid && !/\/groups\/[^/]+\/posts\/\d+/.test(article.outerHTML)) return;
+        fired = true;
+        mo.disconnect();
+        log(`#${idx}: hydration detected, re-processing`);
+        processed.delete(article);
+        processPost(article);
       });
       mo.observe(article, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
     }
 
-    // Also keep the viewport-based fallback for slow networks where pfbid
-    // arrives via a future XHR rather than a DOM mutation.
-    if (retryScheduled.has(article)) return;
-    retryScheduled.add(article);
-
-    const io = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        log(`retry #${postIdx}: post in viewport, waiting 1500ms for hydration`);
-        io.disconnect();
-        setTimeout(() => {
-          log(`retry #${postIdx}: re-running processPost`);
-          processPost(article);
-        }, 1500);
-        break;
-      }
-    }, { threshold: 0.3 });
-
-    io.observe(article);
+    // IntersectionObserver: retry after a delay when post re-enters viewport
+    if (!retryScheduled.has(article)) {
+      retryScheduled.add(article);
+      const io = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          io.disconnect();
+          setTimeout(() => { processed.delete(article); processPost(article); }, 1500);
+          break;
+        }
+      }, { threshold: 0.3 });
+      io.observe(article);
+    }
   }
+
+  // ── processPost ──────────────────────────────────────────────────────────────
 
   async function processPost(article) {
     if (processed.has(article)) return;
+    // Skip comment/reply articles
+    const aria = article.getAttribute('aria-label') || '';
+    if (/^(Comment|Reply) by/i.test(aria)) return;
     processed.add(article);
-    const postIdx = ++postCounter;
-    const rect = article.getBoundingClientRect();
-    const messageEl = article.querySelector('[data-ad-rendering-role="story_message"], [data-ad-preview="message"]');
-    const messagePreview = messageEl ? messageEl.textContent.slice(0, 60).replace(/\s+/g, ' ') : '(no message el)';
-    log(`processPost #${postIdx}: starting`);
-    log(`  container tag=${article.tagName} class="${article.className.slice(0, 60)}..."`);
-    log(`  rect: top=${Math.round(rect.top)} left=${Math.round(rect.left)} w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
-    log(`  message preview: "${messagePreview}"`);
 
-    let pfbid = getPostPfbid(article);
-    if (!pfbid) {
-      log(`processPost #${postIdx}: no pfbid on first pass, setting up viewport retry`);
+    const idx = ++postCounter;
+    const target = getFeedbackTarget(article);
+
+    if (!target) {
+      log(`#${idx}: no target, will retry on hydration`);
       processed.delete(article);
-      setupPfbidRetry(article, postIdx);
+      setupRetry(article, idx);
       return;
     }
 
-    // Use the count from the intercepted feed response. If it's not present
-    // (older response shape, or response not yet seen), fall back to a single
-    // tooltip query. The tooltip's resharer list is fetched LAZILY on first
-    // hover, not here — avoids per-post API calls on viewport entry and
-    // keeps us well clear of FB's rate limit during long scrolls.
-    let count = window.__fbsrShareCountMap && window.__fbsrShareCountMap.get(pfbid);
+    log(`#${idx}: target = ${String(target).slice(0, 30)}…`);
+
+    // Share count: use cache or fall back to API
+    const scMap = window.__fbsrShareCountMap;
+    let count = scMap && scMap.get(target);
     if (typeof count !== 'number') {
-      log(`processPost #${postIdx}: count not cached, falling back to tooltipQuery`);
       try {
-        const data = await tooltipQuery(pfbid);
-        count = data?.data?.feedback?.reshares?.count;
+        const data = await queryTooltip(target);
+        count = data && data.data && data.data.feedback &&
+          data.data.feedback.reshares && data.data.feedback.reshares.count;
       } catch (e) {
-        err(`processPost #${postIdx}: tooltip query threw`, e);
+        err(`#${idx}: tooltip query failed`, e);
         return;
       }
     }
-    log(`processPost #${postIdx}: pfbid=${pfbid.slice(0, 24)}… count=${count}`);
-    window.__fbsrReport.push({ postIdx, pfbid, count, message: messagePreview });
+
     if (!count || count <= 0) {
-      log(`processPost #${postIdx}: count is zero, skipping injection`);
+      log(`#${idx}: ${count} shares, skipping`);
       return;
     }
 
-    // Pass empty resharers — the tooltip will fetch them on first hover.
-    injectLink(article, pfbid, count, [], postIdx);
+    injectLink(article, target, count, idx);
   }
 
-  function injectLink(article, pfbid, count, initialResharers, postIdx) {
-    if (article.querySelector('.fbsr-link-container')) {
-      log(`injectLink #${postIdx}: container already exists, skipping`);
-      return;
-    }
+  // ── injectLink ───────────────────────────────────────────────────────────────
 
-    log(`injectLink #${postIdx}: injecting "${count} share${count !== 1 ? 's' : ''}" link`);
+  function injectLink(article, target, count, idx) {
+    if (article.querySelector('.fbsr-link-container')) return;
 
-    const container = document.createElement('div');
-    container.className = 'fbsr-link-container';
+    log(`#${idx}: injecting "${count} share${count !== 1 ? 's' : ''}"`);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'fbsr-link-container';
 
     const link = document.createElement('a');
     link.className = 'fbsr-link';
     link.href = '#';
     link.textContent = count === 1 ? '1 share' : `${count} shares`;
-    // Store the resolved pfbid so the recycling detector can verify the
-    // link still belongs to the right post after FB reuses the DOM node.
-    link.dataset.fbsrPfbid = String(pfbid);
-    let tooltipEl = null;
-    let hoverTimer = null;
-    // Lazy: tooltipData is null until first hover triggers a fetch. If we
-    // were handed initialResharers from a prior tooltipQuery call (legacy
-    // path), use those.
-    let tooltipData = initialResharers && initialResharers.length ? initialResharers : null;
-    let tooltipFetchInFlight = false;
 
-    async function ensureTooltipData() {
-      if (tooltipData || tooltipFetchInFlight) return;
-      tooltipFetchInFlight = true;
+    // ── Tooltip ──────────────────────────────────────────────────────────────
+    let tooltipEl = null;
+    let tooltipData = null;
+    let tooltipFetchDone = false;
+
+    async function loadTooltipData() {
+      if (tooltipFetchDone) return;
+      tooltipFetchDone = true;
       try {
-        const data = await tooltipQuery(pfbid);
-        tooltipData = data?.data?.feedback?.legacy_resharers || [];
-        // Re-render if the tooltip is still visible.
-        if (tooltipEl) renderTooltipContent(tooltipEl, tooltipData, count);
+        const data = await queryTooltip(target);
+        tooltipData = data && data.data && data.data.feedback &&
+          data.data.feedback.legacy_resharers || [];
       } catch (e) {
-        err(`tooltip #${postIdx}: fetch failed`, e);
         tooltipData = [];
-        if (tooltipEl) renderTooltipContent(tooltipEl, tooltipData, count);
-      } finally {
-        tooltipFetchInFlight = false;
+      }
+      if (tooltipEl) renderTooltip(tooltipEl, tooltipData, count);
+    }
+
+    function renderTooltip(el, resharers, total) {
+      el.innerHTML = '';
+      if (!resharers || !resharers.length) {
+        const s = document.createElement('span');
+        s.className = 'fbsr-tooltip-loading';
+        s.textContent = total > 0 ? 'No visible sharers' : 'No shares';
+        el.appendChild(s);
+        return;
+      }
+      for (const r of resharers) {
+        const n = document.createElement('span');
+        n.className = 'fbsr-tooltip-name';
+        n.textContent = r.name;
+        el.appendChild(n);
+      }
+      if (resharers.length < total) {
+        const more = document.createElement('span');
+        more.className = 'fbsr-tooltip-name';
+        more.style.color = '#65676b';
+        more.textContent = `and ${total - resharers.length} more`;
+        el.appendChild(more);
       }
     }
 
     function showTooltip() {
       if (tooltipEl) return;
-      // Guard: if the mouse already left the link by the time the 300ms
-      // delay elapsed, don't show. (Can happen if the user clicked the link
-      // or clicked the underlying post which opens FB's own modal, both of
-      // which take focus away before mouseleave fires reliably.)
-      if (!link.matches(':hover')) {
-        log(`tooltip #${postIdx}: cancelled (link no longer hovered)`);
-        return;
-      }
-      log(`tooltip #${postIdx}: showing`);
       tooltipEl = document.createElement('div');
       tooltipEl.className = 'fbsr-tooltip';
-      // If we don't have the data yet, render a loading state and trigger
-      // the fetch. ensureTooltipData() re-renders when data arrives.
       if (tooltipData) {
-        renderTooltipContent(tooltipEl, tooltipData, count);
+        renderTooltip(tooltipEl, tooltipData, count);
       } else {
-        const loading = document.createElement('span');
-        loading.className = 'fbsr-tooltip-loading';
-        loading.textContent = 'Loading…';
-        tooltipEl.appendChild(loading);
-        ensureTooltipData();
+        const s = document.createElement('span');
+        s.className = 'fbsr-tooltip-loading';
+        s.textContent = 'Loading…';
+        tooltipEl.appendChild(s);
+        loadTooltipData();
       }
       document.body.appendChild(tooltipEl);
       positionTooltip(tooltipEl, link);
-
-      // Safety net: dismiss the tooltip if the user clicks anywhere or if
-      // the document becomes hidden (e.g., FB's own modal takes over). Use
-      // capture phase so we run even if FB stops propagation.
-      const dismissOnClick = (e) => {
-        if (!tooltipEl || tooltipEl.contains(e.target) || link.contains(e.target)) return;
-        hideTooltip();
-      };
-      const dismissOnVisibility = () => { hideTooltip(); };
-      const dismissOnScroll = () => { hideTooltip(); };
-      const dismissOnEsc = (e) => { if (e.key === 'Escape') hideTooltip(); };
-      // Watchdog: every 500ms, check whether the link is still visible. If
-      // FB has covered it with a modal/dialog, dismiss the tooltip.
-      const watchdog = setInterval(() => {
-        if (!tooltipEl) { clearInterval(watchdog); return; }
-        const rect = link.getBoundingClientRect();
-        const cx = rect.left + rect.width / 2;
-        const cy = rect.top + rect.height / 2;
-        // Off-screen or zero-size → the link's container is gone.
-        if (rect.width === 0 || rect.height === 0 ||
-            cy < 0 || cy > window.innerHeight ||
-            cx < 0 || cx > window.innerWidth) {
-          hideTooltip();
-          return;
-        }
-        // Something else is on top of the link → likely a FB modal.
-        const elAtPoint = document.elementFromPoint(cx, cy);
-        if (elAtPoint && !link.contains(elAtPoint) && !elAtPoint.contains(link)) {
-          hideTooltip();
-        }
-      }, 500);
-      document.addEventListener('click', dismissOnClick, true);
-      document.addEventListener('visibilitychange', dismissOnVisibility);
-      document.addEventListener('keydown', dismissOnEsc, true);
-      window.addEventListener('scroll', dismissOnScroll, { passive: true });
-      tooltipEl.__cleanup = () => {
-        clearInterval(watchdog);
-        document.removeEventListener('click', dismissOnClick, true);
-        document.removeEventListener('visibilitychange', dismissOnVisibility);
-        document.removeEventListener('keydown', dismissOnEsc, true);
-        window.removeEventListener('scroll', dismissOnScroll);
-      };
+      attachTooltipDismiss();
     }
 
     function hideTooltip() {
-      if (tooltipEl) {
-        log(`tooltip #${postIdx}: hiding`);
-        try { tooltipEl.__cleanup?.(); } catch {}
-        tooltipEl.remove();
-        tooltipEl = null;
-      }
+      if (!tooltipEl) return;
+      try { tooltipEl.__cleanup && tooltipEl.__cleanup(); } catch (e) { /* ignore */ }
+      tooltipEl.remove();
+      tooltipEl = null;
     }
 
-    link.addEventListener('mouseenter', () => {
-      clearTimeout(hoverTimer);
-      // Cancel the pending tooltip if the user clicks ANYWHERE before the
-      // 300ms delay elapses — likely they clicked the underlying post (which
-      // opens FB's own lightbox) and we don't want our tooltip to materialize
-      // afterwards. Capture phase + once so we don't accumulate listeners.
-      const onClickDuringWait = () => {
-        clearTimeout(hoverTimer);
-        hoverTimer = null;
-        document.removeEventListener('click', onClickDuringWait, true);
-      };
-      document.addEventListener('click', onClickDuringWait, true);
-      hoverTimer = setTimeout(() => {
-        document.removeEventListener('click', onClickDuringWait, true);
-        showTooltip();
-      }, 300);
-    });
-    link.addEventListener('mouseleave', () => {
-      clearTimeout(hoverTimer);
-      hideTooltip();
-    });
+    function positionTooltip(el, anchor) {
+      const r = anchor.getBoundingClientRect();
+      let top = window.scrollY + r.bottom + 6;
+      let left = window.scrollX + r.left;
+      const elW = el.offsetWidth || 260;
+      if (left + elW > window.scrollX + window.innerWidth - 8) {
+        left = window.scrollX + window.innerWidth - elW - 8;
+      }
+      el.style.top = `${top}px`;
+      el.style.left = `${left}px`;
+    }
 
+    function attachTooltipDismiss() {
+      const onOutsideClick = (e) => {
+        if (!tooltipEl || tooltipEl.contains(e.target) || link.contains(e.target)) return;
+        hideTooltip();
+      };
+      const onEsc = (e) => { if (e.key === 'Escape') hideTooltip(); };
+      const onScroll = () => hideTooltip();
+      // Watchdog: dismiss if FB modal covers our link
+      const watchdog = setInterval(() => {
+        if (!tooltipEl) { clearInterval(watchdog); return; }
+        const r = link.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) { hideTooltip(); return; }
+        const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        if (el && !link.contains(el) && !el.contains(link)) hideTooltip();
+      }, 500);
+      document.addEventListener('click', onOutsideClick, true);
+      document.addEventListener('keydown', onEsc, true);
+      window.addEventListener('scroll', onScroll, { passive: true });
+      tooltipEl.__cleanup = () => {
+        clearInterval(watchdog);
+        document.removeEventListener('click', onOutsideClick, true);
+        document.removeEventListener('keydown', onEsc, true);
+        window.removeEventListener('scroll', onScroll);
+      };
+    }
+
+    // Cancel pending show if user clicks something before mouseenter resolves
+    link.addEventListener('mouseenter', () => {
+      const cancelOnClick = () => { document.removeEventListener('click', cancelOnClick, true); };
+      document.addEventListener('click', cancelOnClick, true);
+      showTooltip();
+    });
+    link.addEventListener('mouseleave', hideTooltip);
     link.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      log(`link #${postIdx}: clicked, opening modal`);
-      clearTimeout(hoverTimer);
       hideTooltip();
-      openModal(pfbid, count);
+      openModal(target, count);
     });
 
-    container.appendChild(link);
-    placeContainer(article, container, postIdx);
+    wrap.appendChild(link);
+    placeLink(article, wrap, idx);
   }
 
-  function renderTooltipContent(el, resharers, count) {
-    el.innerHTML = '';
-    if (!resharers || resharers.length === 0) {
-      const s = document.createElement('span');
-      s.className = 'fbsr-tooltip-loading';
-      s.textContent = count > 0 ? 'No visible sharers' : 'No shares';
-      el.appendChild(s);
-      return;
-    }
-    for (const r of resharers) {
-      const n = document.createElement('span');
-      n.className = 'fbsr-tooltip-name';
-      n.textContent = r.name;
-      el.appendChild(n);
-    }
-    if (resharers.length < count) {
-      const more = document.createElement('span');
-      more.className = 'fbsr-tooltip-name';
-      more.style.color = '#65676b';
-      more.textContent = `and ${count - resharers.length} more`;
-      el.appendChild(more);
-    }
-  }
+  // ── placeLink ────────────────────────────────────────────────────────────────
 
-  function positionTooltip(tooltipEl, anchor) {
-    const r = anchor.getBoundingClientRect();
-    const t = tooltipEl.getBoundingClientRect();
-    let top = window.scrollY + r.bottom + 6;
-    let left = window.scrollX + r.left;
-    if (left + t.width > window.scrollX + window.innerWidth - 8) {
-      left = window.scrollX + window.innerWidth - t.width - 8;
-    }
-    tooltipEl.style.top = `${top}px`;
-    tooltipEl.style.left = `${left}px`;
-  }
-
-  // ============================================================
-  // Container placement
-  // ============================================================
-
-  function placeContainer(article, container, postIdx) {
+  function placeLink(article, wrap, idx) {
     const shareBtn = article.querySelector('[data-ad-rendering-role="share_button"]');
-    if (!shareBtn) {
-      warn(`placeContainer #${postIdx}: no share button`);
-      article.appendChild(container);
-      return;
-    }
+    if (!shareBtn) { article.appendChild(wrap); return; }
 
-    // Walk up to find the action row (smallest ancestor with all 3 action buttons, no composer).
-    let actionRow = shareBtn;
-    for (let i = 0; i < 10 && actionRow; i++) {
-      actionRow = actionRow.parentElement;
-      if (!actionRow || actionRow === article) break;
-      const hasLike = !!actionRow.querySelector('[aria-label="Like"]');
-      const hasComment = !!actionRow.querySelector('[aria-label="Leave a comment"]');
-      const hasShare = !!actionRow.querySelector('[data-ad-rendering-role="share_button"]');
-      const hasEditable = !!actionRow.querySelector('[contenteditable="true"]');
-      if (hasLike && hasComment && hasShare && !hasEditable) {
-        // Insert as the LAST child of the action row, so the flex layout
-        // places our link inline with the like/comment/share buttons.
-        actionRow.appendChild(container);
-        const rect = container.getBoundingClientRect();
-        log(`placeContainer #${postIdx}: appended into action row at depth ${i + 1}, rect: top=${Math.round(rect.top)} left=${Math.round(rect.left)} w=${Math.round(rect.width)} h=${Math.round(rect.height)}`);
+    let row = shareBtn;
+    for (let i = 0; i < 10 && row; i++) {
+      row = row.parentElement;
+      if (!row || row === article) break;
+      if (row.querySelector('[aria-label="Like"]') &&
+        row.querySelector('[aria-label="Leave a comment"]') &&
+        row.querySelector('[data-ad-rendering-role="share_button"]') &&
+        !row.querySelector('[contenteditable="true"]')) {
+        row.appendChild(wrap);
         return;
       }
     }
-    warn(`placeContainer #${postIdx}: walk failed, appending to article`);
-    article.appendChild(container);
+    warn(`#${idx}: could not find action row, appending to article`);
+    article.appendChild(wrap);
   }
 
-  // ============================================================
-  // Modal
-  // ============================================================
+  // ── Modal ────────────────────────────────────────────────────────────────────
 
-  function openModal(pfbid, count) {
+  function openModal(target, shareCount) {
     const backdrop = document.createElement('div');
     backdrop.className = 'fbsr-modal-backdrop';
 
@@ -979,76 +641,45 @@ function fbsrMain() {
 
     const body = document.createElement('div');
     body.className = 'fbsr-modal-body';
-    const status = document.createElement('div');
-    status.className = 'fbsr-modal-status';
-    status.textContent = 'Loading…';
-    body.appendChild(status);
+    const initStatus = document.createElement('div');
+    initStatus.className = 'fbsr-modal-status';
+    initStatus.textContent = 'Loading…';
+    body.appendChild(initStatus);
 
     modal.appendChild(header);
     modal.appendChild(body);
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
 
-    // Prevent the page behind the modal from scrolling. FB applies
-    // overflow-y: scroll on <html> with !important, so we can't beat it by
-    // setting overflow there. Instead, freeze the body in place via
-    // position: fixed and re-apply the current scroll offset as a negative
-    // top, then restore on close.
+    // Scroll lock
     const scrollY = window.scrollY;
-    const prevBodyStyle = {
-      position: document.body.style.position,
-      top: document.body.style.top,
-      left: document.body.style.left,
-      right: document.body.style.right,
-      width: document.body.style.width,
+    const prevStyle = {
+      position: document.body.style.position, top: document.body.style.top,
+      left: document.body.style.left, right: document.body.style.right, width: document.body.style.width,
     };
-    document.body.style.position = 'fixed';
-    document.body.style.top = `-${scrollY}px`;
-    document.body.style.left = '0';
-    document.body.style.right = '0';
-    document.body.style.width = '100%';
+    Object.assign(document.body.style, { position: 'fixed', top: `-${scrollY}px`, left: '0', right: '0', width: '100%' });
 
     function close() {
-      log('modal: closing');
       backdrop.remove();
       document.removeEventListener('keydown', onKey);
-      // Restore body styles and scroll position.
-      document.body.style.position = prevBodyStyle.position;
-      document.body.style.top = prevBodyStyle.top;
-      document.body.style.left = prevBodyStyle.left;
-      document.body.style.right = prevBodyStyle.right;
-      document.body.style.width = prevBodyStyle.width;
+      Object.assign(document.body.style, prevStyle);
       window.scrollTo(0, scrollY);
     }
-    function onKey(e) {
-      if (e.key === 'Escape') close();
-    }
+    function onKey(e) { if (e.key === 'Escape') close(); }
     closeBtn.addEventListener('click', close);
-    backdrop.addEventListener('click', (e) => {
-      if (e.target === backdrop) close();
-    });
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
     document.addEventListener('keydown', onKey);
 
-    // Paginated fetch: load first page, then auto-fetch more when the user
-    // scrolls to the bottom of the modal body. Stop when has_next_page is false.
-    const renderedIds = new Set(); // dedupe by edge.node.id
+    // Pagination state
+    const rendered = new Set();
     let nextCursor = null;
+    let feedbackBase64Id = null;
+    let firstPageLoaded = false;
     let hasMore = true;
     let loading = false;
     let totalRendered = 0;
-
-    function renderEdges(edges) {
-      for (const edge of edges) {
-        const id = edge?.node?.id;
-        if (id && renderedIds.has(id)) continue;
-        if (id) renderedIds.add(id);
-        const row = buildSharerRow(edge);
-        if (row) {
-          body.appendChild(row);
-          totalRendered++;
-        }
-      }
-    }
+    let sentinel = null;
+    let io = null;
 
     function showStatus(text) {
       const s = document.createElement('div');
@@ -1058,13 +689,15 @@ function fbsrMain() {
       return s;
     }
 
-    let sentinel = null;
-    let io = null;
-
-    // After the first page we'll need the feedback's base64 id (different
-    // from the pfbid) to drive the pagination query.
-    let feedbackBase64Id = null;
-    let firstPageLoaded = false;
+    function renderEdges(edges) {
+      for (const edge of (edges || [])) {
+        const id = edge && edge.node && edge.node.id;
+        if (id && rendered.has(id)) continue;
+        if (id) rendered.add(id);
+        const card = buildSharerCard(edge);
+        if (card) { body.appendChild(card); totalRendered++; }
+      }
+    }
 
     async function loadMore() {
       if (loading || !hasMore) return;
@@ -1074,58 +707,50 @@ function fbsrMain() {
         const prevCursor = nextCursor;
         let reshares;
         if (!firstPageLoaded) {
-          const data = await dialogQuery(pfbid, 10);
-          feedbackBase64Id = data?.data?.feedback?.id || null;
-          reshares = data?.data?.feedback?.reshares;
+          const data = await queryDialog(target);
+          feedbackBase64Id = data && data.data && data.data.feedback && data.data.feedback.id || null;
+          reshares = data && data.data && data.data.feedback && data.data.feedback.reshares;
           firstPageLoaded = true;
         } else {
-          if (!feedbackBase64Id || !nextCursor) {
-            hasMore = false;
-          } else {
-            const data = await paginationQuery(feedbackBase64Id, nextCursor, 10);
-            // Pagination response wraps the connection under `node`.
-            reshares = data?.data?.node?.reshares || data?.data?.feedback?.reshares;
+          if (!feedbackBase64Id || !nextCursor) { hasMore = false; }
+          else {
+            const data = await queryPagination(feedbackBase64Id, nextCursor);
+            reshares = (data && data.data && data.data.node && data.data.node.reshares) ||
+              (data && data.data && data.data.feedback && data.data.feedback.reshares);
           }
         }
 
-        const edges = reshares?.edges || [];
-        const pageInfo = reshares?.page_info || reshares?.pageInfo || {};
+        const edges = reshares && reshares.edges || [];
+        const pageInfo = reshares && (reshares.page_info || reshares.pageInfo) || {};
         nextCursor = pageInfo.end_cursor || pageInfo.endCursor || null;
-        const cursorAdvanced = nextCursor && nextCursor !== prevCursor;
-        const reportedHasNext = pageInfo.has_next_page !== undefined ? pageInfo.has_next_page : pageInfo.hasNextPage;
-        hasMore = edges.length > 0 && cursorAdvanced && reportedHasNext !== false;
-        log(`modal: page returned ${edges.length} edges, hasMore=${hasMore}, feedbackId=${feedbackBase64Id ? feedbackBase64Id.slice(0, 12) + '…' : 'none'}, cursor=${nextCursor ? String(nextCursor).slice(0, 12) + '…' : 'none'}`);
+        const advanced = nextCursor && nextCursor !== prevCursor;
+        const reportedHN = pageInfo.has_next_page !== undefined ? pageInfo.has_next_page : pageInfo.hasNextPage;
+        hasMore = edges.length > 0 && !!advanced && reportedHN !== false;
 
         if (loadingEl) loadingEl.remove();
         if (sentinel) { sentinel.remove(); sentinel = null; }
-
         renderEdges(edges);
 
         if (totalRendered === 0 && !hasMore) {
-          showStatus(count > 0 ? 'No visible sharers (some may be private).' : 'No one has shared this post.');
+          showStatus(shareCount > 0 ? 'No visible sharers (some may be private).' : 'No one has shared this post.');
           return;
         }
-        if (totalRendered < count && !hasMore) {
-          const hidden = count - totalRendered;
+        if (totalRendered < shareCount && !hasMore) {
+          const hidden = shareCount - totalRendered;
           showStatus(`${hidden} sharer${hidden === 1 ? '' : 's'} hidden by privacy settings.`);
           return;
         }
         if (hasMore) {
-          sentinel = document.createElement('div');
-          sentinel.className = 'fbsr-modal-status';
-          sentinel.textContent = 'Loading more…';
-          body.appendChild(sentinel);
+          sentinel = showStatus('Loading more…');
           if (!io) {
             io = new IntersectionObserver((entries) => {
-              for (const e of entries) {
-                if (e.isIntersecting) loadMore();
-              }
+              if (entries[0].isIntersecting) loadMore();
             }, { root: body, threshold: 0.1 });
           }
           io.observe(sentinel);
         }
       } catch (e) {
-        err('modal: page query failed', e);
+        err('modal load failed', e);
         if (loadingEl) loadingEl.remove();
         if (sentinel) { sentinel.remove(); sentinel = null; }
         showStatus('Failed to load sharers.');
@@ -1134,72 +759,59 @@ function fbsrMain() {
       }
     }
 
-    // Cleanup observer when modal closes. We rely on the original `close`
-    // function (declared above) — we just intercept it to also disconnect
-    // the IntersectionObserver. Wrap by overriding the global function via
-    // a flag check instead of reassignment (function declarations can't be
-    // reassigned in strict mode reliably across scopes).
+    // Disconnect IntersectionObserver when modal closes
     const origRemove = backdrop.remove.bind(backdrop);
-    backdrop.remove = function () {
-      if (io) { io.disconnect(); io = null; }
-      origRemove();
-    };
+    backdrop.remove = () => { if (io) { io.disconnect(); io = null; } origRemove(); };
 
-    // Clear the initial "Loading…" status that the outer code put in body.
     body.innerHTML = '';
-
     loadMore();
   }
 
-  function buildSharerRow(edge) {
-    const node = edge.node;
-    const shareStory = node?.comet_sections?.context_layout?.story;
-    if (!shareStory) {
-      warn('buildSharerRow: missing context_layout.story');
-      return null;
-    }
-    const actor = shareStory.comet_sections?.actor_photo?.story?.actors?.[0];
-    if (!actor) {
-      warn('buildSharerRow: missing actor');
-      return null;
-    }
+  // ── Sharer card ──────────────────────────────────────────────────────────────
 
-    let creationTime = null;
-    let privacyDesc = null;
-    let privacyIconName = null;
-    for (const m of shareStory.comet_sections?.metadata || []) {
-      const tn = m.__typename;
-      if (tn === 'CometFeedStoryLongerTimestampStrategy' && m.story?.creation_time) {
+  function buildSharerCard(edge) {
+    const node = edge.node;
+    const shareStory = node && node.comet_sections && node.comet_sections.context_layout && node.comet_sections.context_layout.story;
+    if (!shareStory) { warn('buildSharerCard: missing context_layout.story'); return null; }
+    const actor = shareStory.comet_sections && shareStory.comet_sections.actor_photo &&
+      shareStory.comet_sections.actor_photo.story && shareStory.comet_sections.actor_photo.story.actors &&
+      shareStory.comet_sections.actor_photo.story.actors[0];
+    if (!actor) { warn('buildSharerCard: missing actor'); return null; }
+
+    let creationTime = null, privacyDesc = null, privacyIconName = null;
+    for (const m of (shareStory.comet_sections && shareStory.comet_sections.metadata || [])) {
+      if (m.__typename === 'CometFeedStoryLongerTimestampStrategy' && m.story && m.story.creation_time) {
         creationTime = m.story.creation_time;
-      } else if (tn === 'CometFeedStoryAudienceStrategy') {
-        privacyDesc = m.story?.privacy_scope?.description;
-        privacyIconName = m.story?.privacy_scope?.icon_image?.name;
+      } else if (m.__typename === 'CometFeedStoryAudienceStrategy' && m.story && m.story.privacy_scope) {
+        privacyDesc = m.story.privacy_scope.description;
+        privacyIconName = m.story.privacy_scope.icon_image && m.story.privacy_scope.icon_image.name;
       }
     }
 
-    const captionText =
-      node?.comet_sections?.content?.story?.comet_sections?.message?.story?.message?.text;
-    const hasAttachment = (node?.attachments?.length || 0) > 0
-      || (node?.comet_sections?.content?.story?.attachments?.length || 0) > 0
-      || !!node?.attached_story;
+    const captionText = node.comet_sections && node.comet_sections.content && node.comet_sections.content.story &&
+      node.comet_sections.content.story.comet_sections && node.comet_sections.content.story.comet_sections.message &&
+      node.comet_sections.content.story.comet_sections.message.story &&
+      node.comet_sections.content.story.comet_sections.message.story.message &&
+      node.comet_sections.content.story.comet_sections.message.story.message.text;
+    const hasAttachment = !!(node.attachments && node.attachments.length ||
+      node.comet_sections && node.comet_sections.content && node.comet_sections.content.story &&
+      node.comet_sections.content.story.attachments && node.comet_sections.content.story.attachments.length ||
+      node.attached_story);
     const profileHref = actor.profile_url || actor.url || '#';
     const postHref = node.permalink_url || '#';
 
     const card = document.createElement('div');
     card.className = 'fbsr-sharer-card';
 
-    const header = document.createElement('div');
-    header.className = 'fbsr-sharer-header';
+    const cardHeader = document.createElement('div');
+    cardHeader.className = 'fbsr-sharer-header';
 
-    // Avatar → profile
     const avatarLink = document.createElement('a');
-    avatarLink.href = profileHref;
-    avatarLink.target = '_blank';
-    avatarLink.rel = 'noopener noreferrer';
+    avatarLink.href = profileHref; avatarLink.target = '_blank'; avatarLink.rel = 'noopener noreferrer';
     avatarLink.className = 'fbsr-sharer-avatar-link';
     const img = document.createElement('img');
     img.className = 'fbsr-sharer-avatar';
-    img.src = actor.profile_picture?.uri || '';
+    img.src = actor.profile_picture && actor.profile_picture.uri || '';
     img.alt = '';
     img.referrerPolicy = 'no-referrer';
     avatarLink.appendChild(img);
@@ -1207,56 +819,44 @@ function fbsrMain() {
     const info = document.createElement('div');
     info.className = 'fbsr-sharer-info';
 
-    // Name → profile
     const nameLink = document.createElement('a');
-    nameLink.className = 'fbsr-sharer-name';
-    nameLink.href = profileHref;
-    nameLink.target = '_blank';
-    nameLink.rel = 'noopener noreferrer';
+    nameLink.className = 'fbsr-sharer-name'; nameLink.href = profileHref;
+    nameLink.target = '_blank'; nameLink.rel = 'noopener noreferrer';
     nameLink.textContent = actor.name;
-    info.appendChild(nameLink);
 
-    // Friend descriptor like "shared a memory." if present in the title.
-    const titleStory = shareStory.comet_sections?.title?.story;
-    const titleText = titleStory?.title?.text;
+    // Title trail (e.g. "shared a memory.")
+    const titleText = shareStory.comet_sections && shareStory.comet_sections.title &&
+      shareStory.comet_sections.title.story && shareStory.comet_sections.title.story.title &&
+      shareStory.comet_sections.title.story.title.text;
     if (titleText && titleText.indexOf(actor.name) === 0) {
       const trailing = titleText.slice(actor.name.length).trim();
       if (trailing) {
-        const sub = document.createElement('span');
-        sub.className = 'fbsr-sharer-title-trail';
-        sub.textContent = ' ' + trailing;
-        nameLink.appendChild(sub);
+        const trail = document.createElement('span');
+        trail.className = 'fbsr-sharer-title-trail';
+        trail.textContent = ' ' + trailing;
+        nameLink.appendChild(trail);
       }
     }
+    info.appendChild(nameLink);
 
     const metaRow = document.createElement('div');
     metaRow.className = 'fbsr-sharer-meta';
     if (creationTime) {
-      // Timestamp → the reshare post itself
       const ts = document.createElement('a');
-      ts.className = 'fbsr-sharer-timestamp';
-      ts.href = postHref;
-      ts.target = '_blank';
-      ts.rel = 'noopener noreferrer';
+      ts.className = 'fbsr-sharer-timestamp'; ts.href = postHref;
+      ts.target = '_blank'; ts.rel = 'noopener noreferrer';
       ts.textContent = formatRelativeTime(creationTime);
       metaRow.appendChild(ts);
     }
     if (privacyIconName || privacyDesc) {
-      if (creationTime) {
-        const dot = document.createElement('span');
-        dot.className = 'fbsr-sharer-dot';
-        dot.textContent = ' · ';
-        metaRow.appendChild(dot);
-      }
+      if (creationTime) { const dot = document.createElement('span'); dot.textContent = ' · '; metaRow.appendChild(dot); }
       const pIcon = document.createElement('span');
-      pIcon.className = 'fbsr-sharer-privacy';
-      pIcon.title = privacyDesc || '';
-      pIcon.textContent = privacyIconToGlyph(privacyIconName);
+      pIcon.className = 'fbsr-sharer-privacy'; pIcon.title = privacyDesc || '';
+      pIcon.textContent = privacyGlyph(privacyIconName);
       metaRow.appendChild(pIcon);
     }
     if (metaRow.childNodes.length) info.appendChild(metaRow);
 
-    // Caption is plain text, no link.
     if (captionText) {
       const caption = document.createElement('div');
       caption.className = 'fbsr-sharer-caption';
@@ -1264,37 +864,30 @@ function fbsrMain() {
       info.appendChild(caption);
     }
 
-    header.appendChild(avatarLink);
-    header.appendChild(info);
-    card.appendChild(header);
+    cardHeader.appendChild(avatarLink);
+    cardHeader.appendChild(info);
+    card.appendChild(cardHeader);
 
-    // Show Attachment → the ORIGINAL post (attached_story's permalink), not
-    // the reshare. The reshare is already accessible via the timestamp link.
-    const attachedStory = node?.attached_story
-      || node?.comet_sections?.content?.story?.attached_story;
-    const originalHref = attachedStory?.permalink_url || attachedStory?.url || null;
+    // Show Attachment → original post
+    const attachedStory = (node && node.attached_story) ||
+      (node && node.comet_sections && node.comet_sections.content &&
+        node.comet_sections.content.story && node.comet_sections.content.story.attached_story);
+    const originalHref = attachedStory && (attachedStory.permalink_url || attachedStory.url);
     if (hasAttachment && originalHref) {
-      const showBtn = document.createElement('a');
-      showBtn.className = 'fbsr-sharer-attachment-btn';
-      showBtn.href = originalHref;
-      showBtn.target = '_blank';
-      showBtn.rel = 'noopener noreferrer';
-      showBtn.textContent = 'Show Attachment';
-      card.appendChild(showBtn);
+      const btn = document.createElement('a');
+      btn.className = 'fbsr-sharer-attachment-btn'; btn.href = originalHref;
+      btn.target = '_blank'; btn.rel = 'noopener noreferrer'; btn.textContent = 'Show Attachment';
+      card.appendChild(btn);
     }
 
     return card;
   }
 
-  function privacyIconToGlyph(name) {
-    // FB's privacy icon names. Use unicode glyphs so we don't depend on icons.
+  function privacyGlyph(name) {
     switch (name) {
-      case 'globe':
-      case 'everyone':
-      case 'public': return '🌐';
+      case 'globe': case 'everyone': case 'public': return '🌐';
       case 'friends': return '👥';
-      case 'only_me':
-      case 'lock': return '🔒';
+      case 'only_me': case 'lock': return '🔒';
       case 'custom': return '⚙';
       default: return '·';
     }
@@ -1309,188 +902,73 @@ function fbsrMain() {
     return new Date(unix * 1000).toLocaleDateString();
   }
 
-  // ============================================================
-  // Observer
-  // ============================================================
+  // ── Inline-script seeding ────────────────────────────────────────────────────
+  // FB server-renders the first batch of posts as inline JSON. We parse them
+  // here so the pfbidMap is populated before the user interacts with anything.
 
-  function findPostContainers(root = document) {
-    // A post is identifiable by having a share_button + comment_button.
-    // The post container is the nearest ancestor that contains the message and the action row.
-    const shareButtons = root.querySelectorAll('[data-ad-rendering-role="share_button"]');
-    const containers = new Set();
-    // Detect watch/photo pages — they don't have story_message, only a share
-    // button next to an action row. On these pages we treat the share button's
-    // immediate action-row ancestor as the container.
-    const isStandalonePage =
-      location.pathname.startsWith('/watch') ||
-      location.pathname.startsWith('/photo') ||
-      location.pathname.startsWith('/reel/');
-    shareButtons.forEach(sb => {
-      // Walk up until we find an element that ALSO contains a story_message
-      let el = sb;
-      let foundFeedContainer = false;
-      for (let i = 0; i < 15 && el; i++) {
-        el = el.parentElement;
-        if (!el) break;
-        if (el.querySelector('[data-ad-rendering-role="story_message"]') ||
-          el.querySelector('[data-ad-preview="message"]') ||
-          el.querySelector('[aria-label^="Actions for this post"]')) {
-          containers.add(el);
-          foundFeedContainer = true;
-          break;
-        }
-      }
-      // Standalone-page fallback: action row is the share button's nearest
-      // ancestor that also contains a like or comment button. There's no
-      // story_message on these pages, so we use the action row itself as the
-      // container — it has enough room to inject the link and the URL gives
-      // us the feedback target.
-      if (!foundFeedContainer && isStandalonePage) {
-        let cur = sb;
-        for (let i = 0; i < 6 && cur; i++) {
-          cur = cur.parentElement;
-          if (!cur) break;
-          // An action row typically contains Like + Comment + Share.
-          const looksLikeActionRow =
-            cur.querySelectorAll('[role="button"][aria-label]').length >= 2;
-          if (looksLikeActionRow) {
-            containers.add(cur);
-            break;
-          }
-        }
-      }
-    });
-    return [...containers];
-  }
-
-  function scanExistingPosts() {
-    if (RESTRICT_TO_OWN_PROFILE && !isOnOwnProfile()) {
-      log('scanExistingPosts: not on own profile, skipping scan');
-      return;
+  function seedFromInlineScripts() {
+    if (window.__FBSR_DISABLE_SEEDING || typeof window.__fbsrIndexObject !== 'function') return;
+    let added = 0;
+    for (const s of document.querySelectorAll('script:not([src])')) {
+      const txt = s.textContent;
+      if (!txt || txt.length < 1000) continue;
+      if (txt.indexOf('post_id') === -1) continue;
+      if (txt.indexOf('pfbid') === -1 && txt.indexOf('permalink_url') === -1) continue;
+      try { added += window.__fbsrIndexObject(JSON.parse(txt)); } catch (e) { /* not JSON, skip */ }
     }
-    const posts = findPostContainers();
-    log(`scanExistingPosts: found ${posts.length} post container(s)`);
-    posts.forEach(processPost);
+    if (added) log(`seeded ${added} entries from inline scripts`);
   }
 
-  let mutationCount = 0;
+  // ── Scan & observe ───────────────────────────────────────────────────────────
+
+  function scanPosts() {
+    findPostContainers().forEach(processPost);
+  }
+
+  let mapRescanTimer = null;
+  window.__fbsrOnMapUpdate = () => {
+    if (mapRescanTimer) return;
+    mapRescanTimer = setTimeout(() => { mapRescanTimer = null; scanPosts(); }, 250);
+  };
+
   const observer = new MutationObserver((mutations) => {
-    mutationCount++;
-    if (RESTRICT_TO_OWN_PROFILE && !isOnOwnProfile()) return;
     const containers = new Set();
     for (const m of mutations) {
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
         findPostContainers(node).forEach(c => containers.add(c));
-        // Also check if the added node itself completes a post
-        if (node.querySelector?.('[data-ad-rendering-role="share_button"]')) {
+        if (node.querySelector && node.querySelector('[data-ad-rendering-role="share_button"]')) {
           findPostContainers(node.parentElement || node).forEach(c => containers.add(c));
         }
       }
     }
-    // Catch hydration of existing skeletons by rescanning periodically when mutations occur
     if (mutations.length > 0) {
-      findPostContainers().forEach(c => {
-        if (!processed.has(c)) containers.add(c);
-      });
+      findPostContainers().forEach(c => { if (!processed.has(c)) containers.add(c); });
     }
-    if (containers.size > 0) {
-      log(`observer: batch #${mutationCount}, ${containers.size} post container(s)`);
-      containers.forEach(processPost);
-    }
+    containers.forEach(processPost);
   });
-
-  // Parse FB's server-rendered inline <script> blocks to extract post data
-  // for the first batch of posts shown on page load. These posts don't come
-  // through XHR, so without this seeding the intercept never sees them and
-  // their pfbids stay invisible to us until the user hovers.
-  //
-  // FB wraps the data in a structure like:
-  //   { require: [["ScheduledServerJS","handle",null,[{__bbox:{...,require:[
-  //     ["RelayPrefetchedStreamCache","next",[],[<token>, {__bbox:{
-  //       complete:true, result:{data:{viewer:{news_feed:{edges:[...]}}}}
-  //     }}]]
-  //   ]}}]]] }
-  // We don't try to match that exact path — we just parse each candidate
-  // script as JSON, then let indexResponseForPfbids walk the whole tree
-  // (it already finds post_id + wwwURL/permalink_url shapes wherever they
-  // live).
-  function seedFromInlineScripts() {
-    // Toggleable: set window.__FBSR_DISABLE_SEEDING = true in console to skip.
-    if (window.__FBSR_DISABLE_SEEDING) {
-      log('seedFromInlineScripts: disabled via flag, skipping');
-      return;
-    }
-    if (typeof window.__fbsrIndexObject !== 'function') return;
-    let scriptsScanned = 0, scriptsParsed = 0, totalAdded = 0;
-    const scripts = document.querySelectorAll('script:not([src])');
-    for (const s of scripts) {
-      const txt = s.textContent;
-      // Pre-filter: only scan scripts that obviously contain post data.
-      if (!txt || txt.length < 1000) continue;
-      if (txt.indexOf('post_id') === -1) continue;
-      if (txt.indexOf('pfbid') === -1 && txt.indexOf('permalink_url') === -1) continue;
-      scriptsScanned++;
-      let obj;
-      try {
-        obj = JSON.parse(txt);
-        scriptsParsed++;
-      } catch (e) {
-        continue; // not valid JSON (e.g. raw JS init code) — skip silently
-      }
-      try {
-        const added = window.__fbsrIndexObject(obj);
-        if (added) totalAdded += added;
-      } catch (e) { /* ignore per-script errors */ }
-    }
-    log(`seedFromInlineScripts: scanned=${scriptsScanned} parsed=${scriptsParsed} added=${totalAdded}`);
-  }
-
-  // Seed once at startup. Schedule a second pass shortly after — FB sometimes
-  // streams additional <script> blocks into the document during initial render.
-  setTimeout(seedFromInlineScripts, 100);
-  setTimeout(seedFromInlineScripts, 2000);
-
   observer.observe(document.body, { childList: true, subtree: true });
-  log('observer: attached to document.body');
 
+  // SPA navigation
   let lastUrl = location.href;
   setInterval(() => {
     if (location.href !== lastUrl) {
-      log('URL changed:', lastUrl, '→', location.href);
+      log('navigation:', lastUrl, '→', location.href);
       lastUrl = location.href;
-      cachedSlug = null;
-      // Re-seed from any newly-rendered inline scripts after navigation, and
-      // re-scan posts. Delay gives FB time to swap content in for SPA nav.
       setTimeout(seedFromInlineScripts, 600);
-      setTimeout(scanExistingPosts, 500);
+      setTimeout(scanPosts, 500);
     }
   }, 1000);
 
-  setTimeout(() => {
-    log('initial scan starting (after 1500ms delay)');
-    scanExistingPosts();
-  }, 1500);
+  // Initial seed + scan
+  setTimeout(seedFromInlineScripts, 100);
+  setTimeout(seedFromInlineScripts, 2000);
+  setTimeout(scanPosts, 1500);
 
-  // When the intercept indexes new entries, re-scan posts that didn't have
-  // a pfbid on first pass. processed is a WeakSet keyed by article, and
-  // processPost early-exits if already present, so this is safe — only
-  // newly-unprocessed articles (those we explicitly removed via
-  // processed.delete) will be re-tried.
-  let mapRescanTimer = null;
-  window.__fbsrOnMapUpdate = () => {
-    if (mapRescanTimer) return;
-    // Debounce: many responses can arrive in a short burst.
-    mapRescanTimer = setTimeout(() => {
-      mapRescanTimer = null;
-      log('mapUpdate: re-scanning posts');
-      scanExistingPosts();
-    }, 250);
-  };
+  log('ready');
 }
 
-// Run main logic once DOM is ready (the intercept above runs immediately so it
-// can patch XHR before FB issues any /api/graphql/ requests).
+// ─── Boot ─────────────────────────────────────────────────────────────────────
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', fbsrMain, { once: true });
 } else {
