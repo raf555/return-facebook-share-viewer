@@ -1,18 +1,28 @@
 {
   "manifest_version": 3,
-  "name": "FB Share Revealer",
+  "name": "Return Facebook Share Viewer",
   "version": "0.2.0",
-  "description": "Re-enables the 'who shared your post' feature on your own Facebook profile.",
+  "description": "Re-enables the 'who shared your post' feature on your Facebook website.",
   "content_scripts": [
     {
-      "matches": ["*://www.facebook.com/*", "*://facebook.com/*"],
-      "js": ["content.js"],
-      "css": ["styles.css"],
+      "matches": [
+        "*://www.facebook.com/*",
+        "*://facebook.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     }
   ],
   "host_permissions": [
     "*://*.facebook.com/*"
-  ]
+  ],
+  "icons": {
+    "128": "assets/icon.png"
+  }
 }
