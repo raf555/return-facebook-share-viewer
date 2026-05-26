@@ -174,12 +174,40 @@ window.__FBSR_DEBUG = false;
             let name = '?';
             try { name = new URLSearchParams(this.__fbsrSentBody || '').get('fb_api_req_friendly_name') || '?'; } catch (e) { /* ignore */ }
             if (window.__feedBodies.length >= 50) window.__feedBodies.shift();
-            window.__feedBodies.push({ friendlyName: name, size: this.responseText.length, text: this.responseText });
+            window.__feedBodies.push({ friendlyName: name, size: this.responseText.length, text: this.responseText, via: 'xhr' });
           } catch (e) { /* ignore */ }
         }
       });
     }
     return origSend.apply(this, arguments);
+  };
+
+  // ── fetch patch ─────────────────────────────────────────────────────────────
+  // The extension's own callGraphQL uses fetch(), so the XHR patch above never
+  // sees those calls. We also patch fetch so __feedBodies captures everything,
+  // and so future debugging sees responses regardless of how FB issued them.
+  const origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    const isGraphQL = url.indexOf('/api/graphql') !== -1;
+    const sentBody = init && init.body;
+    const p = origFetch.apply(this, arguments);
+    if (!isGraphQL) return p;
+    return p.then(async (res) => {
+      try {
+        const clone = res.clone();
+        const text = await clone.text();
+        try { onGraphQLResponse(text); } catch (e) { /* ignore */ }
+        if (window.__FBSR_DEBUG) {
+          if (!window.__feedBodies) window.__feedBodies = [];
+          let name = '?';
+          try { name = new URLSearchParams(typeof sentBody === 'string' ? sentBody : '').get('fb_api_req_friendly_name') || '?'; } catch (e) { /* ignore */ }
+          if (window.__feedBodies.length >= 50) window.__feedBodies.shift();
+          window.__feedBodies.push({ friendlyName: name, size: text.length, text, via: 'fetch' });
+        }
+      } catch (e) { /* ignore */ }
+      return res;
+    });
   };
 
   console.log('[FBSR] intercept installed' + (window.__FBSR_DEBUG ? ' [debug]' : ''));
@@ -700,7 +728,10 @@ function fbsrMain() {
     }
 
     async function loadMore() {
-      if (loading || !hasMore) return;
+      if (loading || !hasMore) {
+        log(`modal loadMore: skip (loading=${loading}, hasMore=${hasMore})`);
+        return;
+      }
       loading = true;
       const loadingEl = sentinel ? null : showStatus('Loading sharers…');
       try {
@@ -712,11 +743,16 @@ function fbsrMain() {
           reshares = data && data.data && data.data.feedback && data.data.feedback.reshares;
           firstPageLoaded = true;
         } else {
-          if (!feedbackBase64Id || !nextCursor) { hasMore = false; }
-          else {
+          if (!feedbackBase64Id || !nextCursor) {
+            log(`modal loadMore: missing id/cursor (id=${!!feedbackBase64Id}, cursor=${!!nextCursor})`);
+            hasMore = false;
+          } else {
             const data = await queryPagination(feedbackBase64Id, nextCursor);
             reshares = (data && data.data && data.data.node && data.data.node.reshares) ||
               (data && data.data && data.data.feedback && data.data.feedback.reshares);
+            if (!reshares) {
+              log('modal loadMore: pagination response has no reshares', JSON.stringify(data?.data || {}).slice(0, 200));
+            }
           }
         }
 
@@ -726,6 +762,7 @@ function fbsrMain() {
         const advanced = nextCursor && nextCursor !== prevCursor;
         const reportedHN = pageInfo.has_next_page !== undefined ? pageInfo.has_next_page : pageInfo.hasNextPage;
         hasMore = edges.length > 0 && !!advanced && reportedHN !== false;
+        log(`modal loadMore: edges=${edges.length} advanced=${!!advanced} reportedHN=${reportedHN} hasMore=${hasMore} totalRendered=${totalRendered + edges.length}`);
 
         if (loadingEl) loadingEl.remove();
         if (sentinel) { sentinel.remove(); sentinel = null; }
@@ -742,12 +779,23 @@ function fbsrMain() {
         }
         if (hasMore) {
           sentinel = showStatus('Loading more…');
-          if (!io) {
-            io = new IntersectionObserver((entries) => {
-              if (entries[0].isIntersecting) loadMore();
-            }, { root: body, threshold: 0.1 });
-          }
+          // Recreate IO each time to avoid any quirks with re-observing after
+          // the previous sentinel was removed from DOM.
+          if (io) io.disconnect();
+          io = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting) {
+              log('modal: sentinel intersecting, calling loadMore');
+              loadMore();
+            }
+          }, { root: body, threshold: 0.1 });
           io.observe(sentinel);
+          // If the modal body still has no scroll (sentinel is visible from
+          // the start), the IntersectionObserver won't reliably re-fire for
+          // each new sentinel we create. Proactively schedule the next load
+          // so we keep fetching until the body fills up.
+          if (body.scrollHeight <= body.clientHeight) {
+            setTimeout(loadMore, 100);
+          }
         }
       } catch (e) {
         err('modal load failed', e);
@@ -758,6 +806,18 @@ function fbsrMain() {
         loading = false;
       }
     }
+
+    // Scroll-based fallback: IntersectionObserver can be unreliable when
+    // sentinels are rapidly created/removed. Trigger loadMore when the user
+    // scrolls within 200px of the body's bottom.
+    body.addEventListener('scroll', () => {
+      if (!hasMore || loading) return;
+      const distFromBottom = body.scrollHeight - body.scrollTop - body.clientHeight;
+      if (distFromBottom < 200) {
+        log(`modal: scroll near bottom (dist=${distFromBottom}), calling loadMore`);
+        loadMore();
+      }
+    }, { passive: true });
 
     // Disconnect IntersectionObserver when modal closes
     const origRemove = backdrop.remove.bind(backdrop);
