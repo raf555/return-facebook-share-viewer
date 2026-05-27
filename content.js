@@ -398,10 +398,24 @@ function fbsrMain() {
 
   // ── Retry infrastructure ─────────────────────────────────────────────────────
 
-  const processed = new WeakSet();
-  const retryScheduled = new WeakSet();
-  const hydrationWatched = new WeakSet();
+  // State that should be reset on navigation. WeakSets can't be iterated or
+  // cleared, so we replace them with fresh ones in resetState().
+  let processed = new WeakSet();
+  let retryScheduled = new WeakSet();
+  let hydrationWatched = new WeakSet();
   let postCounter = 0;
+
+  // Called when the URL changes (SPA navigation). Wipes per-post state and
+  // removes any injected links so posts reusing the same DOM article element
+  // on the new page get re-processed from scratch — otherwise the stale
+  // share count from the previous page sticks around.
+  function resetState() {
+    processed = new WeakSet();
+    retryScheduled = new WeakSet();
+    hydrationWatched = new WeakSet();
+    for (const el of document.querySelectorAll('.fbsr-link-container')) el.remove();
+    log('state reset');
+  }
 
   function setupRetry(article, idx) {
     // MutationObserver: re-run when an outer pfbid hydrates into the DOM.
@@ -1015,6 +1029,10 @@ function fbsrMain() {
     if (location.href !== lastUrl) {
       log('navigation:', lastUrl, '→', location.href);
       lastUrl = location.href;
+      // Wipe per-post state and remove stale links so the new page starts
+      // clean. Without this, share counts from the previous page persist on
+      // recycled article elements.
+      resetState();
       setTimeout(seedFromInlineScripts, 600);
       setTimeout(scanPosts, 500);
     }
