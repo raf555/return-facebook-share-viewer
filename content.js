@@ -644,14 +644,19 @@ function fbsrMain() {
     const shareBtn = article.querySelector('[data-ad-rendering-role="share_button"]');
     if (!shareBtn) { article.appendChild(wrap); return; }
 
+    // Walk up from the share button. The action row is the nearest ancestor
+    // that has display:flex AND contains both the comment button and the
+    // share button. We use data-ad-rendering-role attributes (stable) rather
+    // than aria-label (varies by post state and FB rev).
     let row = shareBtn;
     for (let i = 0; i < 10 && row; i++) {
       row = row.parentElement;
       if (!row || row === article) break;
-      if (row.querySelector('[aria-label="Like"]') &&
-        row.querySelector('[aria-label="Leave a comment"]') &&
-        row.querySelector('[data-ad-rendering-role="share_button"]') &&
-        !row.querySelector('[contenteditable="true"]')) {
+      const hasComment = !!row.querySelector('[data-ad-rendering-role="comment_button"]');
+      const hasShare = !!row.querySelector('[data-ad-rendering-role="share_button"]');
+      const hasEditable = !!row.querySelector('[contenteditable="true"]');
+      const display = getComputedStyle(row).display;
+      if (hasComment && hasShare && !hasEditable && display === 'flex') {
         row.appendChild(wrap);
         return;
       }
