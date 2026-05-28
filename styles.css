@@ -277,6 +277,15 @@ html[data-theme="dark"] .fbsr-sharer-caption,
   gap: 4px;
 }
 
+.fbsr-reaction-icons {
+  display: inline-flex;
+  align-items: center;
+}
+
+.fbsr-reaction-icons svg + svg {
+  margin-left: -3px;
+}
+
 html[data-theme="dark"] .fbsr-sharer-engagement,
 .__fb-dark-mode .fbsr-sharer-engagement {
   color: #b0b3b8;
