@@ -263,6 +263,25 @@ html[data-theme="dark"] .fbsr-sharer-caption,
   color: #e4e6eb;
 }
 
+.fbsr-sharer-engagement {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: #65676b;
+}
+
+.fbsr-sharer-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+html[data-theme="dark"] .fbsr-sharer-engagement,
+.__fb-dark-mode .fbsr-sharer-engagement {
+  color: #b0b3b8;
+}
+
 .fbsr-sharer-attachment-btn {
   display: block;
   text-align: center;

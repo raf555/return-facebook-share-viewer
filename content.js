@@ -947,6 +947,68 @@ function fbsrMain() {
     cardHeader.appendChild(info);
     card.appendChild(cardHeader);
 
+    // Engagement row: reactions, comments, and shares ON THE RESHARE itself.
+    // These numbers tell you how the reshare did, separately from the original.
+    const ufiFeedback =
+      node && node.comet_sections && node.comet_sections.feedback &&
+      node.comet_sections.feedback.story &&
+      node.comet_sections.feedback.story.story_ufi_container &&
+      node.comet_sections.feedback.story.story_ufi_container.story &&
+      node.comet_sections.feedback.story.story_ufi_container.story.feedback_context &&
+      node.comet_sections.feedback.story.story_ufi_container.story.feedback_context.feedback_target_with_context;
+    if (ufiFeedback) {
+      const renderer = ufiFeedback.comet_ufi_summary_and_actions_renderer &&
+                       ufiFeedback.comet_ufi_summary_and_actions_renderer.feedback;
+      // Pull reaction_count and share_count from the action renderers
+      let reactionCount = null;
+      let shareCount = null;
+      for (const r of ((renderer && renderer.adaptive_ufi_action_renderers) || [])) {
+        const f = r && r.feedback;
+        if (!f) continue;
+        if (f.reaction_count && typeof f.reaction_count.count === 'number') reactionCount = f.reaction_count.count;
+        if (f.share_count && typeof f.share_count.count === 'number') shareCount = f.share_count.count;
+      }
+      // Top reaction icons (we use unicode emojis based on the localized name)
+      const topReactions = (renderer && renderer.top_reactions && renderer.top_reactions.edges) || [];
+      const topEmojis = topReactions
+        .slice(0, 3)
+        .map(e => reactionEmoji(e && e.node && e.node.localized_name))
+        .filter(Boolean);
+      // Comment count from comment_list_renderer
+      const commentCount =
+        ufiFeedback.comment_list_renderer &&
+        ufiFeedback.comment_list_renderer.feedback &&
+        ufiFeedback.comment_list_renderer.feedback.comment_rendering_instance_for_feed_location &&
+        ufiFeedback.comment_list_renderer.feedback.comment_rendering_instance_for_feed_location.comments &&
+        ufiFeedback.comment_list_renderer.feedback.comment_rendering_instance_for_feed_location.comments.total_count;
+
+      const hasAny = reactionCount || commentCount || shareCount;
+      if (hasAny) {
+        const row = document.createElement('div');
+        row.className = 'fbsr-sharer-engagement';
+        if (reactionCount) {
+          const span = document.createElement('span');
+          span.className = 'fbsr-sharer-stat';
+          const emojis = topEmojis.length ? topEmojis.join('') : '👍';
+          span.textContent = `${emojis} ${formatCount(reactionCount)}`;
+          row.appendChild(span);
+        }
+        if (commentCount) {
+          const span = document.createElement('span');
+          span.className = 'fbsr-sharer-stat';
+          span.textContent = `💬 ${formatCount(commentCount)}`;
+          row.appendChild(span);
+        }
+        if (shareCount) {
+          const span = document.createElement('span');
+          span.className = 'fbsr-sharer-stat';
+          span.textContent = `🔄 ${formatCount(shareCount)}`;
+          row.appendChild(span);
+        }
+        card.appendChild(row);
+      }
+    }
+
     // Show Attachment → original post
     const attachedStory = (node && node.attached_story) ||
       (node && node.comet_sections && node.comet_sections.content &&
@@ -960,6 +1022,27 @@ function fbsrMain() {
     }
 
     return card;
+  }
+
+  // Format a number compactly: 1234 → "1.2K", 95 → "95"
+  function formatCount(n) {
+    if (n < 1000) return String(n);
+    if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, '') + 'K';
+    return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+  }
+
+  // Map FB's localized reaction names to emojis
+  function reactionEmoji(name) {
+    if (!name) return '';
+    const n = name.toLowerCase();
+    if (n.includes('like'))  return '👍';
+    if (n.includes('love'))  return '❤️';
+    if (n.includes('care'))  return '🥰';
+    if (n.includes('haha'))  return '😂';
+    if (n.includes('wow'))   return '😮';
+    if (n.includes('sad'))   return '😢';
+    if (n.includes('angry')) return '😡';
+    return '👍';
   }
 
   function privacyGlyph(name) {
