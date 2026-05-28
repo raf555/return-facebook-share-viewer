@@ -644,14 +644,19 @@ function fbsrMain() {
     const shareBtn = article.querySelector('[data-ad-rendering-role="share_button"]');
     if (!shareBtn) { article.appendChild(wrap); return; }
 
+    // Walk up from the share button. The action row is the nearest ancestor
+    // that has display:flex AND contains both the comment button and the
+    // share button. We use data-ad-rendering-role attributes (stable) rather
+    // than aria-label (varies by post state and FB rev).
     let row = shareBtn;
     for (let i = 0; i < 10 && row; i++) {
       row = row.parentElement;
       if (!row || row === article) break;
-      if (row.querySelector('[aria-label="Like"]') &&
-        row.querySelector('[aria-label="Leave a comment"]') &&
-        row.querySelector('[data-ad-rendering-role="share_button"]') &&
-        !row.querySelector('[contenteditable="true"]')) {
+      const hasComment = !!row.querySelector('[data-ad-rendering-role="comment_button"]');
+      const hasShare = !!row.querySelector('[data-ad-rendering-role="share_button"]');
+      const hasEditable = !!row.querySelector('[contenteditable="true"]');
+      const display = getComputedStyle(row).display;
+      if (hasComment && hasShare && !hasEditable && display === 'flex') {
         row.appendChild(wrap);
         return;
       }
@@ -926,7 +931,7 @@ function fbsrMain() {
       if (creationTime) { const dot = document.createElement('span'); dot.textContent = ' · '; metaRow.appendChild(dot); }
       const pIcon = document.createElement('span');
       pIcon.className = 'fbsr-sharer-privacy'; pIcon.title = privacyDesc || '';
-      pIcon.textContent = privacyGlyph(privacyIconName);
+      pIcon.appendChild(privacyGlyph(privacyIconName));
       metaRow.appendChild(pIcon);
     }
     if (metaRow.childNodes.length) info.appendChild(metaRow);
@@ -942,7 +947,7 @@ function fbsrMain() {
     cardHeader.appendChild(info);
     card.appendChild(cardHeader);
 
-    // Show Attachment → original post
+    // Show Attachment → original post (above engagement stats)
     const attachedStory = (node && node.attached_story) ||
       (node && node.comet_sections && node.comet_sections.content &&
         node.comet_sections.content.story && node.comet_sections.content.story.attached_story);
@@ -954,16 +959,191 @@ function fbsrMain() {
       card.appendChild(btn);
     }
 
+    // Engagement row: reactions, comments, and shares ON THE RESHARE itself.
+    // These numbers tell you how the reshare did, separately from the original.
+    const ufiFeedback =
+      node && node.comet_sections && node.comet_sections.feedback &&
+      node.comet_sections.feedback.story &&
+      node.comet_sections.feedback.story.story_ufi_container &&
+      node.comet_sections.feedback.story.story_ufi_container.story &&
+      node.comet_sections.feedback.story.story_ufi_container.story.feedback_context &&
+      node.comet_sections.feedback.story.story_ufi_container.story.feedback_context.feedback_target_with_context;
+    if (ufiFeedback) {
+      const renderer = ufiFeedback.comet_ufi_summary_and_actions_renderer &&
+        ufiFeedback.comet_ufi_summary_and_actions_renderer.feedback;
+      // Pull reaction_count and share_count from the action renderers
+      let reactionCount = null;
+      let shareCount = null;
+      for (const r of ((renderer && renderer.adaptive_ufi_action_renderers) || [])) {
+        const f = r && r.feedback;
+        if (!f) continue;
+        if (f.reaction_count && typeof f.reaction_count.count === 'number') reactionCount = f.reaction_count.count;
+        if (f.share_count && typeof f.share_count.count === 'number') shareCount = f.share_count.count;
+      }
+      // Top reaction icons (we use unicode emojis based on the localized name)
+      const topReactions = (renderer && renderer.top_reactions && renderer.top_reactions.edges) || [];
+      const topReactionIcons = topReactions.slice(0, 3).map(e => e && e.node && e.node.localized_name).filter(Boolean);
+
+      const commentCount =
+        ufiFeedback.comment_list_renderer &&
+        ufiFeedback.comment_list_renderer.feedback &&
+        ufiFeedback.comment_list_renderer.feedback.comment_rendering_instance_for_feed_location &&
+        ufiFeedback.comment_list_renderer.feedback.comment_rendering_instance_for_feed_location.comments &&
+        ufiFeedback.comment_list_renderer.feedback.comment_rendering_instance_for_feed_location.comments.total_count;
+
+      const hasAny = reactionCount || commentCount || shareCount;
+      if (hasAny) {
+        const row = document.createElement('div');
+        row.className = 'fbsr-sharer-engagement';
+        if (reactionCount) {
+          const span = document.createElement('span');
+          span.className = 'fbsr-sharer-stat';
+          // Stack reaction icons (up to 3)
+          const iconWrap = document.createElement('span');
+          iconWrap.className = 'fbsr-reaction-icons';
+          if (topReactionIcons.length) {
+            topReactionIcons.forEach(name => iconWrap.appendChild(makeReactionIcon(name)));
+          } else {
+            iconWrap.appendChild(makeReactionIcon('like'));
+          }
+          span.appendChild(iconWrap);
+          const countTxt = document.createTextNode(' ' + formatCount(reactionCount));
+          span.appendChild(countTxt);
+          row.appendChild(span);
+        }
+        if (commentCount) {
+          const span = document.createElement('span');
+          span.className = 'fbsr-sharer-stat';
+          span.appendChild(makeSvgIcon('comment'));
+          span.appendChild(document.createTextNode(' ' + formatCount(commentCount)));
+          row.appendChild(span);
+        }
+        if (shareCount) {
+          const span = document.createElement('span');
+          span.className = 'fbsr-sharer-stat';
+          span.appendChild(makeSvgIcon('reshare'));
+          span.appendChild(document.createTextNode(' ' + formatCount(shareCount)));
+          row.appendChild(span);
+        }
+        card.appendChild(row);
+      }
+    }
+
     return card;
+  }
+
+  // Format a number compactly: 1234 → "1.2K", 95 → "95"
+  function formatCount(n) {
+    if (n < 1000) return String(n);
+    if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, '') + 'K';
+    return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+  }
+
+  // Returns an inline SVG element for a given icon type.
+  // All icons are 16×16, filled with currentColor so they inherit text color.
+  function makeSvgIcon(type) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.style.display = 'inline-block';
+    svg.style.verticalAlign = 'middle';
+    svg.style.flexShrink = '0';
+
+    // All paths are on a 24×24 grid (Heroicons outline set, MIT license)
+    const icons = {
+      public: {
+        vb: '0 0 24 24', w: 13, h: 13,
+        d: 'M12 21a9.004 9.004 0 0 0 8.716-6.747M12 21a9.004 9.004 0 0 1-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 0 1 7.843 4.582M12 3a8.997 8.997 0 0 0-7.843 4.582m15.686 0A11.953 11.953 0 0 1 12 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0 1 21 12c0 .778-.099 1.533-.284 2.253M3.157 7.582A8.959 8.959 0 0 0 3 12c0 .778.099 1.533.284 2.253m0 0a11.933 11.933 0 0 0 2.63 4.38M3.284 14.253a11.933 11.933 0 0 0 2.63 4.38m0 0A9.003 9.003 0 0 0 12 21m-6.086-2.367a9.003 9.003 0 0 0 6.086 2.367m9.716-8.747A11.953 11.953 0 0 1 12 10.5c-2.998 0-5.74-1.1-7.843-2.918',
+        stroke: true,
+      },
+      friends: {
+        vb: '0 0 24 24', w: 13, h: 13,
+        d: 'M15 19.128a9.38 9.38 0 0 0 2.625.372 9.337 9.337 0 0 0 4.121-.952 4.125 4.125 0 0 0-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 0 1 8.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0 1 11.964-3.07M12 6.375a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0Zm8.25 2.25a2.625 2.625 0 1 1-5.25 0 2.625 2.625 0 0 1 5.25 0Z',
+        stroke: true,
+      },
+      lock: {
+        vb: '0 0 24 24', w: 12, h: 12,
+        d: 'M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z',
+        stroke: true,
+      },
+      comment: {
+        vb: '0 0 24 24', w: 13, h: 13,
+        d: 'M8.625 12a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H8.25m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H12m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 0 1-2.555-.337A5.972 5.972 0 0 1 5.41 20.97a5.969 5.969 0 0 1-.474-.065 4.48 4.48 0 0 0 .978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25Z',
+        stroke: true,
+      },
+      reshare: {
+        vb: '0 0 24 24', w: 13, h: 13,
+        d: 'M7.5 21 3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5',
+        stroke: true,
+      },
+    };
+
+    const icon = icons[type] || icons.comment;
+    svg.setAttribute('viewBox', icon.vb);
+    svg.setAttribute('width', icon.w);
+    svg.setAttribute('height', icon.h);
+    svg.setAttribute('fill', icon.stroke ? 'none' : 'currentColor');
+    if (icon.stroke) {
+      svg.setAttribute('stroke', 'currentColor');
+      svg.setAttribute('stroke-width', '1.5');
+      svg.setAttribute('stroke-linecap', 'round');
+      svg.setAttribute('stroke-linejoin', 'round');
+    }
+
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('stroke-linecap', 'round');
+    path.setAttribute('stroke-linejoin', 'round');
+    path.setAttribute('d', icon.d);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  // Returns a colored circle for FB reaction types.
+  // Uses a div with background color + a letter abbreviation for simplicity
+  // and guaranteed cross-platform consistency.
+  function makeReactionIcon(localizedName) {
+    const n = (localizedName || 'Like').toLowerCase();
+
+    const configs = {
+      like: { bg: '#1877f2', label: '👍' },
+      love: { bg: '#f33e58', label: '❤' },
+      care: { bg: '#f7b125', label: '🤗' },
+      haha: { bg: '#f7b125', label: '😂' },
+      wow: { bg: '#f7b125', label: '😮' },
+      sad: { bg: '#f7b125', label: '😢' },
+      angry: { bg: '#e9710f', label: '😡' },
+    };
+
+    let cfg = configs.like;
+    for (const [key, val] of Object.entries(configs)) {
+      if (n.includes(key)) { cfg = val; break; }
+    }
+
+    const el = document.createElement('span');
+    el.style.cssText = `
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: ${cfg.bg};
+      font-size: 11px;
+      line-height: 1;
+      flex-shrink: 0;
+      border: 1.5px solid var(--card-background, #fff);
+    `;
+    el.textContent = cfg.label;
+    return el;
   }
 
   function privacyGlyph(name) {
     switch (name) {
-      case 'globe': case 'everyone': case 'public': return '🌐';
-      case 'friends': return '👥';
-      case 'only_me': case 'lock': return '🔒';
-      case 'custom': return '⚙';
-      default: return '·';
+      case 'globe': case 'everyone': case 'public': return makeSvgIcon('public');
+      case 'friends': return makeSvgIcon('friends');
+      case 'only_me': case 'lock': return makeSvgIcon('lock');
+      case 'custom': return makeSvgIcon('custom');
+      default: return makeSvgIcon('public');
     }
   }
 
