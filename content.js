@@ -329,6 +329,11 @@ function fbsrMain() {
       const m = path.match(/^\/reel\/(\d+)/);
       if (m) return m[1];
     }
+    // /<user>/videos/<id> — profile video pages
+    {
+      const m = path.match(/\/videos\/(\d+)/);
+      if (m) return m[1];
+    }
 
     const html = article.outerHTML;
 
@@ -364,7 +369,8 @@ function fbsrMain() {
   function findPostContainers(root) {
     root = root || document;
     const containers = new Set();
-    const isStandalone = /^\/(watch|photo|reel\/)/.test(location.pathname);
+    const isStandalone = /^\/(watch|photo|reel\/)/.test(location.pathname) ||
+      /\/videos\/\d+/.test(location.pathname);
 
     for (const sb of root.querySelectorAll('[data-ad-rendering-role="share_button"]')) {
       let el = sb;
@@ -848,6 +854,40 @@ function fbsrMain() {
 
   // ── Sharer card ──────────────────────────────────────────────────────────────
 
+  // Renders a FB message text with entity ranges (mentions, links) as actual
+  // anchor elements. Ranges have { offset, length, entity: { url, __typename } }.
+  function renderTextWithEntities(container, text, ranges) {
+    if (!ranges || ranges.length === 0) {
+      container.textContent = text;
+      return;
+    }
+    // Sort by offset to process left to right
+    const sorted = [...ranges].sort((a, b) => a.offset - b.offset);
+    let cursor = 0;
+    for (const range of sorted) {
+      const { offset, length, entity } = range;
+      if (!entity || !entity.url) continue;
+      // Plain text before this range
+      if (offset > cursor) {
+        container.appendChild(document.createTextNode(text.slice(cursor, offset)));
+      }
+      // The linked entity span
+      const mention = text.slice(offset, offset + length);
+      const a = document.createElement('a');
+      a.href = entity.url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = mention;
+      a.className = 'fbsr-mention';
+      container.appendChild(a);
+      cursor = offset + length;
+    }
+    // Remaining plain text
+    if (cursor < text.length) {
+      container.appendChild(document.createTextNode(text.slice(cursor)));
+    }
+  }
+
   function buildSharerCard(edge) {
     const node = edge.node;
     const shareStory = node && node.comet_sections && node.comet_sections.context_layout && node.comet_sections.context_layout.story;
@@ -867,11 +907,12 @@ function fbsrMain() {
       }
     }
 
-    const captionText = node.comet_sections && node.comet_sections.content && node.comet_sections.content.story &&
+    const captionMsg = node.comet_sections && node.comet_sections.content && node.comet_sections.content.story &&
       node.comet_sections.content.story.comet_sections && node.comet_sections.content.story.comet_sections.message &&
       node.comet_sections.content.story.comet_sections.message.story &&
-      node.comet_sections.content.story.comet_sections.message.story.message &&
-      node.comet_sections.content.story.comet_sections.message.story.message.text;
+      node.comet_sections.content.story.comet_sections.message.story.message;
+    const captionText = captionMsg && captionMsg.text;
+    const captionRanges = (captionMsg && captionMsg.ranges) || [];
     const hasAttachment = !!(node.attachments && node.attachments.length ||
       node.comet_sections && node.comet_sections.content && node.comet_sections.content.story &&
       node.comet_sections.content.story.attachments && node.comet_sections.content.story.attachments.length ||
@@ -939,7 +980,7 @@ function fbsrMain() {
     if (captionText) {
       const caption = document.createElement('div');
       caption.className = 'fbsr-sharer-caption';
-      caption.textContent = captionText;
+      renderTextWithEntities(caption, captionText, captionRanges);
       info.appendChild(caption);
     }
 

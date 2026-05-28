@@ -312,3 +312,13 @@ html[data-theme="dark"] .fbsr-sharer-attachment-btn,
 .__fb-dark-mode .fbsr-sharer-attachment-btn {
   color: #4599ff;
 }
+.fbsr-mention {
+  color: #1877f2;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.fbsr-mention:hover { text-decoration: underline; }
+
+html[data-theme="dark"] .fbsr-mention,
+.__fb-dark-mode .fbsr-mention { color: #4599ff; }

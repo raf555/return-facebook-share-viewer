@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Return Facebook Share Viewer",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Re-enables the 'who shared your post' feature on your Facebook website.",
   "content_scripts": [
     {
