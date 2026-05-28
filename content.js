@@ -329,6 +329,11 @@ function fbsrMain() {
       const m = path.match(/^\/reel\/(\d+)/);
       if (m) return m[1];
     }
+    // /<user>/videos/<id> — profile video pages
+    {
+      const m = path.match(/\/videos\/(\d+)/);
+      if (m) return m[1];
+    }
 
     const html = article.outerHTML;
 
@@ -364,7 +369,8 @@ function fbsrMain() {
   function findPostContainers(root) {
     root = root || document;
     const containers = new Set();
-    const isStandalone = /^\/(watch|photo|reel\/)/.test(location.pathname);
+    const isStandalone = /^\/(watch|photo|reel\/)/.test(location.pathname) ||
+      /\/videos\/\d+/.test(location.pathname);
 
     for (const sb of root.querySelectorAll('[data-ad-rendering-role="share_button"]')) {
       let el = sb;
