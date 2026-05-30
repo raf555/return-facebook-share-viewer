@@ -314,6 +314,57 @@ function fbsrMain() {
   // ── Post identification ──────────────────────────────────────────────────────
   // Returns a feedback target for the given post container, or null.
 
+  // Extracts the FB profile slug from a facebook.com URL.
+  // Returns "username" for /username/... or "id:123" for /profile.php?id=123.
+  // Returns null if the URL doesn't identify a profile.
+  function extractSlugFromHref(href) {
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.origin);
+      if (url.hostname && !url.hostname.endsWith('facebook.com')) return null;
+      if (url.pathname === '/profile.php') {
+        const id = url.searchParams.get('id');
+        return id ? `id:${id}` : null;
+      }
+      const m = url.pathname.match(/^\/([^/]+)/);
+      if (!m) return null;
+      const seg = m[1];
+      // Skip FB system routes — these aren't user slugs
+      const reserved = new Set([
+        'photo', 'photos', 'watch', 'reel', 'groups', 'pages', 'events',
+        'marketplace', 'gaming', 'stories', 'permalink.php', 'story.php',
+        'home.php', 'profile.php', 'public', 'pg', 'people', 'video',
+        'videos', 'help', 'business', 'login', 'logout', 'settings',
+      ]);
+      if (reserved.has(seg)) return null;
+      return seg;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Returns the resharer/poster's profile slug — the user whose name appears
+  // at the top of the post. We use [data-ad-rendering-role="profile_name"]
+  // which FB places exactly on the OUTER actor's name container, not on any
+  // embedded original's actor. Falls back to the first profile-style link if
+  // the rendering role isn't present (older layouts).
+  function getActorSlug(article) {
+    const nameEl = article.querySelector('[data-ad-rendering-role="profile_name"]');
+    if (nameEl) {
+      const a = nameEl.querySelector('a[href]');
+      if (a) {
+        const slug = extractSlugFromHref(a.getAttribute('href'));
+        if (slug) return slug;
+      }
+    }
+    // Fallback: first role=link anchor that resolves to a profile slug.
+    for (const a of article.querySelectorAll('a[role="link"][href]')) {
+      const slug = extractSlugFromHref(a.getAttribute('href'));
+      if (slug) return slug;
+    }
+    return null;
+  }
+
   function getFeedbackTarget(article) {
     // Standalone pages: target comes from the URL (one post per page)
     const path = location.pathname;
@@ -334,28 +385,78 @@ function fbsrMain() {
       const m = path.match(/\/videos\/(\d+)/);
       if (m) return m[1];
     }
+    // /groups/<gid>/?multi_permalinks=<postId> — group single-post permalink
+    // (alternative format alongside /groups/<gid>/posts/<id>/)
+    if (path.startsWith('/groups/')) {
+      const mp = new URLSearchParams(location.search).get('multi_permalinks');
+      if (mp) return mp;
+    }
 
     const html = article.outerHTML;
 
-    // 1. pfbid in DOM (simple regex — fast path, works for most posts)
-    const pfbid = html.match(/pfbid[A-Za-z0-9]+/);
-    if (pfbid) return pfbid[0];
+    // 1. pfbid in DOM. When this article is a reshare, the embedded original
+    //    may have its own pfbid hydrated into the DOM (when the user hovers
+    //    it). That pfbid belongs to a DIFFERENT user. Using it would show the
+    //    original's share count on the reshare card.
+    //
+    //    Fix: find the resharer's profile slug (first actor link in the
+    //    article header) and only accept pfbid anchors whose URL slug matches.
+    //    If none match, fall through to map-based lookups.
+    const pfbidAnchors = article.querySelectorAll('a[href*="pfbid"]');
+    if (pfbidAnchors.length > 0) {
+      const resharerSlug = getActorSlug(article);
+      for (const a of pfbidAnchors) {
+        const href = a.getAttribute('href') || '';
+        const pfbid = (href.match(/pfbid[A-Za-z0-9]+/) || [])[0];
+        if (!pfbid) continue;
+        // If we couldn't determine the resharer, fall back to first pfbid
+        // (preserves old behavior for posts without a clear actor link).
+        if (!resharerSlug) return pfbid;
+        const linkSlug = extractSlugFromHref(href);
+        if (linkSlug && linkSlug === resharerSlug) return pfbid;
+      }
+      // pfbid anchors exist but none match the resharer — they belong to
+      // the embedded original. Don't use them. Fall through.
+    }
 
     // 2. Group post: explicit numeric id in permalink
     const groupPost = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
     if (groupPost) return groupPost[1];
 
+    // 3. Direct video/reel post (uploaded by the actor themselves, not a
+    //    reshare). The watch/reel link is the post's OWN permalink, so its
+    //    id is a valid feedback target.
+    //
+    //    To distinguish from a reshare of a video: check for <h5> in the
+    //    article. FB uses <h4> for the outer actor's name and <h5> for the
+    //    embedded original's actor name. So presence of any <h5> means this
+    //    post has an embedded original — likely a reshare where the outer
+    //    timestamp link also points to the original video (FB quirk). In
+    //    that case the watch id belongs to the original, not the reshare.
+    if (pfbidAnchors.length === 0 && !article.querySelector('h5')) {
+      const mediaLink = article.querySelector(
+        'a[href*="/watch/?v="], a[href*="/watch?v="], a[href*="/reel/"]'
+      );
+      if (mediaLink) {
+        const href = mediaLink.getAttribute('href') || '';
+        const watch = href.match(/[?&]v=(\d+)/);
+        if (watch) return watch[1];
+        const reel = href.match(/\/reel\/(\d+)/);
+        if (reel) return reel[1];
+      }
+    }
+
     const map = window.__fbsrPfbidMap;
     if (!map || !map.size) return null;
 
-    // 3. Group composite key from /groups/<id>/user/<uid>/ DOM links
+    // 4. Group composite key from /groups/<id>/user/<uid>/ DOM links
     const groupUser = html.match(/\/groups\/(\d+)\/user\/(\d+)\//);
     if (groupUser) {
       const t = map.get(`group:${groupUser[1]}:${groupUser[2]}`);
       if (t) return t;
     }
 
-    // 4. Any long numeric ID in the DOM matched against pfbidMap
+    // 5. Any long numeric ID in the DOM matched against pfbidMap
     for (const id of new Set(html.match(/\b\d{14,20}\b/g) || [])) {
       const t = map.get(id);
       if (t) return t;
@@ -424,14 +525,19 @@ function fbsrMain() {
   }
 
   function setupRetry(article, idx) {
-    // MutationObserver: re-run when an outer pfbid hydrates into the DOM.
-    // "Outer" means NOT inside a <blockquote> (the embedded original's wrapper)
-    // so hovering the embedded post doesn't incorrectly trigger re-processing.
+    // MutationObserver: re-run processPost on any href hydration. Keep the
+    // observer alive until a link is actually injected — that way, if the
+    // first hydration produced a wrong target (e.g. the embedded original's
+    // pfbid, rejected by slug-matching), we keep watching for the resharer's
+    // own pfbid to hydrate later.
     if (!hydrationWatched.has(article)) {
       hydrationWatched.add(article);
-      let fired = false;
       const mo = new MutationObserver(() => {
-        if (fired) return;
+        // Stop watching once a link is injected
+        if (article.querySelector('.fbsr-link-container')) {
+          mo.disconnect();
+          return;
+        }
         let hasOuterPfbid = false;
         for (const a of article.querySelectorAll('a[href*="pfbid"]')) {
           let inBQ = false, p = a.parentElement;
@@ -439,8 +545,6 @@ function fbsrMain() {
           if (!inBQ) { hasOuterPfbid = true; break; }
         }
         if (!hasOuterPfbid && !/\/groups\/[^/]+\/posts\/\d+/.test(article.outerHTML)) return;
-        fired = true;
-        mo.disconnect();
         log(`#${idx}: hydration detected, re-processing`);
         processed.delete(article);
         processPost(article);
@@ -494,12 +598,21 @@ function fbsrMain() {
           data.data.feedback.reshares && data.data.feedback.reshares.count;
       } catch (e) {
         err(`#${idx}: tooltip query failed`, e);
+        // Don't lock out future retries — the target may have been wrong and
+        // a real pfbid may hydrate later.
+        processed.delete(article);
+        setupRetry(article, idx);
         return;
       }
     }
 
     if (!count || count <= 0) {
       log(`#${idx}: ${count} shares, skipping`);
+      // The target might have been wrong (e.g. resolved via a stale map entry
+      // before the post's real pfbid hydrated). Keep watching for hydration
+      // so a later mutation can re-process with a better target.
+      processed.delete(article);
+      setupRetry(article, idx);
       return;
     }
 
