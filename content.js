@@ -503,14 +503,19 @@ function fbsrMain() {
   }
 
   function setupRetry(article, idx) {
-    // MutationObserver: re-run when an outer pfbid hydrates into the DOM.
-    // "Outer" means NOT inside a <blockquote> (the embedded original's wrapper)
-    // so hovering the embedded post doesn't incorrectly trigger re-processing.
+    // MutationObserver: re-run processPost on any href hydration. Keep the
+    // observer alive until a link is actually injected — that way, if the
+    // first hydration produced a wrong target (e.g. the embedded original's
+    // pfbid, rejected by slug-matching), we keep watching for the resharer's
+    // own pfbid to hydrate later.
     if (!hydrationWatched.has(article)) {
       hydrationWatched.add(article);
-      let fired = false;
       const mo = new MutationObserver(() => {
-        if (fired) return;
+        // Stop watching once a link is injected
+        if (article.querySelector('.fbsr-link-container')) {
+          mo.disconnect();
+          return;
+        }
         let hasOuterPfbid = false;
         for (const a of article.querySelectorAll('a[href*="pfbid"]')) {
           let inBQ = false, p = a.parentElement;
@@ -518,8 +523,6 @@ function fbsrMain() {
           if (!inBQ) { hasOuterPfbid = true; break; }
         }
         if (!hasOuterPfbid && !/\/groups\/[^/]+\/posts\/\d+/.test(article.outerHTML)) return;
-        fired = true;
-        mo.disconnect();
         log(`#${idx}: hydration detected, re-processing`);
         processed.delete(article);
         processPost(article);
@@ -573,12 +576,21 @@ function fbsrMain() {
           data.data.feedback.reshares && data.data.feedback.reshares.count;
       } catch (e) {
         err(`#${idx}: tooltip query failed`, e);
+        // Don't lock out future retries — the target may have been wrong and
+        // a real pfbid may hydrate later.
+        processed.delete(article);
+        setupRetry(article, idx);
         return;
       }
     }
 
     if (!count || count <= 0) {
       log(`#${idx}: ${count} shares, skipping`);
+      // The target might have been wrong (e.g. resolved via a stale map entry
+      // before the post's real pfbid hydrated). Keep watching for hydration
+      // so a later mutation can re-process with a better target.
+      processed.delete(article);
+      setupRetry(article, idx);
       return;
     }
 
