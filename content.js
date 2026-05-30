@@ -405,15 +405,23 @@ function fbsrMain() {
     const groupPost = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
     if (groupPost) return groupPost[1];
 
-    // 3. Story-share of a video: the post has no pfbid (story format uses a
-    //    different id namespace), the actor link points to /stories/<id>/,
-    //    and there's an embedded /watch/?v=<id> link to the underlying video.
-    //    The video id is a valid feedback target for the shares query.
-    //    We only use it when there's NO pfbid, so regular video reshares
-    //    (which DO have a pfbid) aren't affected.
+    // 3. Story-share of a video or reel: the post has no pfbid (story format
+    //    uses a different id namespace), the FIRST actor link points to
+    //    /stories/<id>/, and there's an embedded /watch/?v=<id> or /reel/<id>/
+    //    link to the underlying media. The media id is a valid feedback target.
+    //    The /stories/ check is critical — a normal reshare of a video/reel
+    //    also has those links in the DOM (as the attachment), but its first
+    //    actor link points to a regular profile. Using the media id there
+    //    would show the ORIGINAL's share count on the reshare card.
     if (pfbidAnchors.length === 0) {
-      const watchVideo = html.match(/\/watch\/?\?v=(\d+)/);
-      if (watchVideo) return watchVideo[1];
+      const firstActor = article.querySelector('a[role="link"][href]');
+      const firstHref = firstActor && firstActor.getAttribute('href') || '';
+      if (/^\/?stories\//.test(firstHref) || /facebook\.com\/stories\//.test(firstHref)) {
+        const watchVideo = html.match(/\/watch\/?\?v=(\d+)/);
+        if (watchVideo) return watchVideo[1];
+        const reel = html.match(/\/reel\/(\d+)/);
+        if (reel) return reel[1];
+      }
     }
 
     const map = window.__fbsrPfbidMap;
