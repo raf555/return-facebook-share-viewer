@@ -385,6 +385,12 @@ function fbsrMain() {
       const m = path.match(/\/videos\/(\d+)/);
       if (m) return m[1];
     }
+    // /groups/<gid>/?multi_permalinks=<postId> — group single-post permalink
+    // (alternative format alongside /groups/<gid>/posts/<id>/)
+    if (path.startsWith('/groups/')) {
+      const mp = new URLSearchParams(location.search).get('multi_permalinks');
+      if (mp) return mp;
+    }
 
     const html = article.outerHTML;
 
