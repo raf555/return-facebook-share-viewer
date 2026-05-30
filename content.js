@@ -343,9 +343,21 @@ function fbsrMain() {
     }
   }
 
-  // Returns the resharer/poster's profile slug — always the first actor link
-  // in the article (the user whose name appears at the top).
+  // Returns the resharer/poster's profile slug — the user whose name appears
+  // at the top of the post. We use [data-ad-rendering-role="profile_name"]
+  // which FB places exactly on the OUTER actor's name container, not on any
+  // embedded original's actor. Falls back to the first profile-style link if
+  // the rendering role isn't present (older layouts).
   function getActorSlug(article) {
+    const nameEl = article.querySelector('[data-ad-rendering-role="profile_name"]');
+    if (nameEl) {
+      const a = nameEl.querySelector('a[href]');
+      if (a) {
+        const slug = extractSlugFromHref(a.getAttribute('href'));
+        if (slug) return slug;
+      }
+    }
+    // Fallback: first role=link anchor that resolves to a profile slug.
     for (const a of article.querySelectorAll('a[role="link"][href]')) {
       const slug = extractSlugFromHref(a.getAttribute('href'));
       if (slug) return slug;
@@ -405,21 +417,25 @@ function fbsrMain() {
     const groupPost = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
     if (groupPost) return groupPost[1];
 
-    // 3. Story-share of a video or reel: the post has no pfbid (story format
-    //    uses a different id namespace), the FIRST actor link points to
-    //    /stories/<id>/, and there's an embedded /watch/?v=<id> or /reel/<id>/
-    //    link to the underlying media. The media id is a valid feedback target.
-    //    The /stories/ check is critical — a normal reshare of a video/reel
-    //    also has those links in the DOM (as the attachment), but its first
-    //    actor link points to a regular profile. Using the media id there
-    //    would show the ORIGINAL's share count on the reshare card.
-    if (pfbidAnchors.length === 0) {
-      const firstActor = article.querySelector('a[role="link"][href]');
-      const firstHref = firstActor && firstActor.getAttribute('href') || '';
-      if (/^\/?stories\//.test(firstHref) || /facebook\.com\/stories\//.test(firstHref)) {
-        const watchVideo = html.match(/\/watch\/?\?v=(\d+)/);
-        if (watchVideo) return watchVideo[1];
-        const reel = html.match(/\/reel\/(\d+)/);
+    // 3. Direct video/reel post (uploaded by the actor themselves, not a
+    //    reshare). The watch/reel link is the post's OWN permalink, so its
+    //    id is a valid feedback target.
+    //
+    //    To distinguish from a reshare of a video: check for <h5> in the
+    //    article. FB uses <h4> for the outer actor's name and <h5> for the
+    //    embedded original's actor name. So presence of any <h5> means this
+    //    post has an embedded original — likely a reshare where the outer
+    //    timestamp link also points to the original video (FB quirk). In
+    //    that case the watch id belongs to the original, not the reshare.
+    if (pfbidAnchors.length === 0 && !article.querySelector('h5')) {
+      const mediaLink = article.querySelector(
+        'a[href*="/watch/?v="], a[href*="/watch?v="], a[href*="/reel/"]'
+      );
+      if (mediaLink) {
+        const href = mediaLink.getAttribute('href') || '';
+        const watch = href.match(/[?&]v=(\d+)/);
+        if (watch) return watch[1];
+        const reel = href.match(/\/reel\/(\d+)/);
         if (reel) return reel[1];
       }
     }
@@ -427,14 +443,14 @@ function fbsrMain() {
     const map = window.__fbsrPfbidMap;
     if (!map || !map.size) return null;
 
-    // 3. Group composite key from /groups/<id>/user/<uid>/ DOM links
+    // 4. Group composite key from /groups/<id>/user/<uid>/ DOM links
     const groupUser = html.match(/\/groups\/(\d+)\/user\/(\d+)\//);
     if (groupUser) {
       const t = map.get(`group:${groupUser[1]}:${groupUser[2]}`);
       if (t) return t;
     }
 
-    // 4. Any long numeric ID in the DOM matched against pfbidMap
+    // 5. Any long numeric ID in the DOM matched against pfbidMap
     for (const id of new Set(html.match(/\b\d{14,20}\b/g) || [])) {
       const t = map.get(id);
       if (t) return t;
