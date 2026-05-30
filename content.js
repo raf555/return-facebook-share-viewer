@@ -314,6 +314,45 @@ function fbsrMain() {
   // ── Post identification ──────────────────────────────────────────────────────
   // Returns a feedback target for the given post container, or null.
 
+  // Extracts the FB profile slug from a facebook.com URL.
+  // Returns "username" for /username/... or "id:123" for /profile.php?id=123.
+  // Returns null if the URL doesn't identify a profile.
+  function extractSlugFromHref(href) {
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.origin);
+      if (url.hostname && !url.hostname.endsWith('facebook.com')) return null;
+      if (url.pathname === '/profile.php') {
+        const id = url.searchParams.get('id');
+        return id ? `id:${id}` : null;
+      }
+      const m = url.pathname.match(/^\/([^/]+)/);
+      if (!m) return null;
+      const seg = m[1];
+      // Skip FB system routes — these aren't user slugs
+      const reserved = new Set([
+        'photo', 'photos', 'watch', 'reel', 'groups', 'pages', 'events',
+        'marketplace', 'gaming', 'stories', 'permalink.php', 'story.php',
+        'home.php', 'profile.php', 'public', 'pg', 'people', 'video',
+        'videos', 'help', 'business', 'login', 'logout', 'settings',
+      ]);
+      if (reserved.has(seg)) return null;
+      return seg;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Returns the resharer/poster's profile slug — always the first actor link
+  // in the article (the user whose name appears at the top).
+  function getActorSlug(article) {
+    for (const a of article.querySelectorAll('a[role="link"][href]')) {
+      const slug = extractSlugFromHref(a.getAttribute('href'));
+      if (slug) return slug;
+    }
+    return null;
+  }
+
   function getFeedbackTarget(article) {
     // Standalone pages: target comes from the URL (one post per page)
     const path = location.pathname;
@@ -337,9 +376,30 @@ function fbsrMain() {
 
     const html = article.outerHTML;
 
-    // 1. pfbid in DOM (simple regex — fast path, works for most posts)
-    const pfbid = html.match(/pfbid[A-Za-z0-9]+/);
-    if (pfbid) return pfbid[0];
+    // 1. pfbid in DOM. When this article is a reshare, the embedded original
+    //    may have its own pfbid hydrated into the DOM (when the user hovers
+    //    it). That pfbid belongs to a DIFFERENT user. Using it would show the
+    //    original's share count on the reshare card.
+    //
+    //    Fix: find the resharer's profile slug (first actor link in the
+    //    article header) and only accept pfbid anchors whose URL slug matches.
+    //    If none match, fall through to map-based lookups.
+    const pfbidAnchors = article.querySelectorAll('a[href*="pfbid"]');
+    if (pfbidAnchors.length > 0) {
+      const resharerSlug = getActorSlug(article);
+      for (const a of pfbidAnchors) {
+        const href = a.getAttribute('href') || '';
+        const pfbid = (href.match(/pfbid[A-Za-z0-9]+/) || [])[0];
+        if (!pfbid) continue;
+        // If we couldn't determine the resharer, fall back to first pfbid
+        // (preserves old behavior for posts without a clear actor link).
+        if (!resharerSlug) return pfbid;
+        const linkSlug = extractSlugFromHref(href);
+        if (linkSlug && linkSlug === resharerSlug) return pfbid;
+      }
+      // pfbid anchors exist but none match the resharer — they belong to
+      // the embedded original. Don't use them. Fall through.
+    }
 
     // 2. Group post: explicit numeric id in permalink
     const groupPost = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
