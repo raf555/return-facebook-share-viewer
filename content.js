@@ -6,7 +6,7 @@
 // ─── Debug flag ───────────────────────────────────────────────────────────────
 // true  → logs to console + captures graphql responses into window.__feedBodies
 // false → silent
-window.__FBSR_DEBUG = false;
+window.__FBSR_DEBUG = true;
 
 // ─── Network intercept ────────────────────────────────────────────────────────
 // Runs at document_start before FB's own scripts. Patches XHR to read every
@@ -474,21 +474,41 @@ function fbsrMain() {
       /\/videos\/\d+/.test(location.pathname);
 
     for (const sb of root.querySelectorAll('[data-ad-rendering-role="share_button"]')) {
+      // Walk up from the share button to find the smallest ancestor that
+      // logically contains ONE post. Three cases:
+      //   1. Normal post: the story_message/actions ancestor contains exactly
+      //      one profile_name — that's the per-post scope.
+      //   2. Multi-share (e.g. "X and Y shared a photo"): the outer container
+      //      has multiple profile_names but each share button has its own
+      //      inner section with exactly one profile_name. We pick that
+      //      inner section so each share button gets its own target.
+      //   3. Fallback: any ancestor with story_message / story-actions.
       let el = sb;
-      let found = false;
+      let scoped = null;        // smallest ancestor with exactly 1 profile_name
+      let storyAncestor = null; // any ancestor with story_message — fallback
       for (let i = 0; i < 15 && el; i++) {
         el = el.parentElement;
         if (!el) break;
-        if (el.querySelector('[data-ad-rendering-role="story_message"]') ||
-          el.querySelector('[data-ad-preview="message"]') ||
-          el.querySelector('[aria-label^="Actions for this post"]')) {
-          containers.add(el);
-          found = true;
-          break;
+        if (!scoped) {
+          const names = el.querySelectorAll('[data-ad-rendering-role="profile_name"]');
+          if (names.length === 1) scoped = el;
         }
+        if (!storyAncestor && (
+          el.querySelector('[data-ad-rendering-role="story_message"]') ||
+          el.querySelector('[data-ad-preview="message"]') ||
+          el.querySelector('[aria-label^="Actions for this post"]')
+        )) {
+          storyAncestor = el;
+        }
+        if (scoped && storyAncestor) break;
+      }
+      const container = scoped || storyAncestor;
+      if (container) {
+        containers.add(container);
+        continue;
       }
       // Standalone-page fallback: use the action-row ancestor
-      if (!found && isStandalone) {
+      if (isStandalone) {
         let cur = sb;
         for (let i = 0; i < 6 && cur; i++) {
           cur = cur.parentElement;
