@@ -365,6 +365,47 @@ function fbsrMain() {
     return null;
   }
 
+  // Reads the share count from server-rendered inline scripts without
+  // calling the API. Used as a fallback when the API is rate-limited.
+  // Searches for "share_count":{"count":N} within 2KB of the target id.
+  function readNativeShareCount(article, target) {
+    if (target) {
+      for (const s of document.querySelectorAll('script:not([src])')) {
+        const txt = s.textContent;
+        if (!txt || txt.indexOf('share_count') === -1) continue;
+        // Find each occurrence of the target id, then look for a share_count
+        // nearby (in either direction since FB JSON ordering varies).
+        let pos = 0;
+        while ((pos = txt.indexOf(String(target), pos)) !== -1) {
+          const ctx = txt.slice(Math.max(0, pos - 2000), pos + 2000);
+          const m = ctx.match(/"share_count":\{"count":(\d+)\}/);
+          if (m) return parseInt(m[1], 10);
+          pos += String(target).length;
+        }
+      }
+    }
+    // Fallback: native count next to the share button in DOM, if FB renders it
+    const shareBtn = article.querySelector('[data-ad-rendering-role="share_button"]');
+    if (shareBtn) {
+      let el = shareBtn;
+      for (let i = 0; i < 5 && el; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        for (const span of el.querySelectorAll('span[dir="auto"]')) {
+          const txt = span.textContent.trim();
+          const m = txt.match(/^([\d,.]+)\s*([KMk]?)$/);
+          if (m) {
+            let n = parseFloat(m[1].replace(/,/g, ''));
+            if (m[2].toUpperCase() === 'K') n *= 1000;
+            if (m[2].toUpperCase() === 'M') n *= 1000000;
+            if (n > 0) return Math.round(n);
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   function getFeedbackTarget(article) {
     // Standalone pages: target comes from the URL (one post per page)
     const path = location.pathname;
@@ -612,17 +653,36 @@ function fbsrMain() {
     const scMap = window.__fbsrShareCountMap;
     let count = scMap && scMap.get(target);
     if (typeof count !== 'number') {
+      let apiFailed = false;
       try {
         const data = await queryTooltip(target);
-        count = data && data.data && data.data.feedback &&
-          data.data.feedback.reshares && data.data.feedback.reshares.count;
+        if (data && data.errors && !data.data) {
+          // API returned errors (rate limit, permission, etc) — fall back
+          const code = data.errors[0] && data.errors[0].code;
+          warn(`#${idx}: API error (code=${code}), trying DOM fallback`);
+          apiFailed = true;
+        } else {
+          count = data && data.data && data.data.feedback &&
+            data.data.feedback.reshares && data.data.feedback.reshares.count;
+        }
       } catch (e) {
-        err(`#${idx}: tooltip query failed`, e);
-        // Don't lock out future retries — the target may have been wrong and
-        // a real pfbid may hydrate later.
-        processed.delete(article);
-        setupRetry(article, idx);
-        return;
+        err(`#${idx}: tooltip query failed, trying DOM fallback`, e);
+        apiFailed = true;
+      }
+      if (apiFailed) {
+        // Read share count from page's inline JSON (server-rendered).
+        // Tooltip + modal will still fail while rate-limited, but at least
+        // the link appears with the right count and is clickable.
+        const native = readNativeShareCount(article, target);
+        if (typeof native === 'number' && native > 0) {
+          log(`#${idx}: got count ${native} from DOM fallback`);
+          count = native;
+        } else {
+          // No fallback available — retry later
+          processed.delete(article);
+          setupRetry(article, idx);
+          return;
+        }
       }
     }
 
