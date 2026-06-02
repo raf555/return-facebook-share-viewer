@@ -6,7 +6,7 @@
 // ─── Debug flag ───────────────────────────────────────────────────────────────
 // true  → logs to console + captures graphql responses into window.__feedBodies
 // false → silent
-window.__FBSR_DEBUG = true;
+window.__FBSR_DEBUG = false;
 
 // ─── Network intercept ────────────────────────────────────────────────────────
 // Runs at document_start before FB's own scripts. Patches XHR to read every
@@ -116,6 +116,26 @@ window.__FBSR_DEBUG = true;
           if (count !== null) shareCountMap.set(target, count);
         }
       }
+      // Story-based shape (profile timeline, reel pages, etc) — no post_id,
+      // but has a feedback.id (base64 of "feedback:<storyId>") and a
+      // share_count somewhere within. Extract the storyId and key the count
+      // by it AND by any attachment media ids.
+      if (node.__typename === 'Story' && node.feedback && typeof node.feedback.id === 'string') {
+        const decoded = decodeBase64Maybe(node.feedback.id);
+        const m = decoded && decoded.match(/^feedback:(\d+)/);
+        if (m) {
+          const storyId = m[1];
+          const count = findShareCount(node);
+          if (count !== null) {
+            shareCountMap.set(storyId, count);
+            for (const att of (node.attachments || [])) {
+              if (!att) continue;
+              if (att.media && att.media.id) shareCountMap.set(att.media.id, count);
+              if (att.target && att.target.id) shareCountMap.set(att.target.id, count);
+            }
+          }
+        }
+      }
       for (const k in node) {
         if (k === 'attached_story') continue;
         if (node[k] && typeof node[k] === 'object') visit(node[k]);
@@ -124,8 +144,19 @@ window.__FBSR_DEBUG = true;
     visit(obj);
   }
 
+  function decodeBase64Maybe(s) {
+    if (!s || typeof s !== 'string') return null;
+    if (!/^[A-Za-z0-9+/=]+$/.test(s)) return null;
+    try { return atob(s); } catch (e) { return null; }
+  }
+
   function onGraphQLResponse(text) {
-    if (!text || (text.indexOf('pfbid') === -1 && text.indexOf('/groups/') === -1)) return;
+    if (!text) return;
+    // Loose gate: process if there's anything indexable. Profile timeline
+    // responses have no pfbid (Story-based shape) but do contain share_count.
+    if (text.indexOf('pfbid') === -1 &&
+        text.indexOf('/groups/') === -1 &&
+        text.indexOf('share_count') === -1) return;
     const before = pfbidMap.size;
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
@@ -369,29 +400,30 @@ function fbsrMain() {
   // calling the API. Used as a fallback when the API is rate-limited.
   // Searches for "share_count":{"count":N} within 2KB of the target id.
   function readNativeShareCount(article, target) {
-    if (target) {
-      for (const s of document.querySelectorAll('script:not([src])')) {
-        const txt = s.textContent;
-        if (!txt || txt.indexOf('share_count') === -1) continue;
-        // Find each occurrence of the target id, then look for a share_count
-        // nearby (in either direction since FB JSON ordering varies).
-        let pos = 0;
-        while ((pos = txt.indexOf(String(target), pos)) !== -1) {
-          const ctx = txt.slice(Math.max(0, pos - 2000), pos + 2000);
-          const m = ctx.match(/"share_count":\{"count":(\d+)\}/);
-          if (m) return parseInt(m[1], 10);
-          pos += String(target).length;
-        }
+    if (!target) return null;
+    for (const s of document.querySelectorAll('script:not([src])')) {
+      const txt = s.textContent;
+      if (!txt || txt.indexOf('share_count') === -1) continue;
+      // Find each occurrence of the target id, then look for a share_count
+      // nearby (in either direction since FB JSON ordering varies).
+      let pos = 0;
+      while ((pos = txt.indexOf(String(target), pos)) !== -1) {
+        const ctx = txt.slice(Math.max(0, pos - 2000), pos + 2000);
+        const m = ctx.match(/"share_count":\{"count":(\d+)\}/);
+        if (m) return parseInt(m[1], 10);
+        pos += String(target).length;
       }
     }
-    // Fallback: native count next to the share button in DOM, if FB renders it
+    // DOM fallback, tightly scoped: find a number ONLY inside the share
+    // button's own aria-label wrapper, never inside sibling Like/Comment
+    // wrappers. FB renders each action as a [aria-label="..."] container
+    // with the number span as a child; for shares, the wrapper has
+    // aria-label="Send this to friends or post it on your profile."
     const shareBtn = article.querySelector('[data-ad-rendering-role="share_button"]');
     if (shareBtn) {
-      let el = shareBtn;
-      for (let i = 0; i < 5 && el; i++) {
-        el = el.parentElement;
-        if (!el) break;
-        for (const span of el.querySelectorAll('span[dir="auto"]')) {
+      let wrapper = shareBtn.closest('[aria-label]');
+      if (wrapper) {
+        for (const span of wrapper.querySelectorAll('span[dir="auto"]')) {
           const txt = span.textContent.trim();
           const m = txt.match(/^([\d,.]+)\s*([KMk]?)$/);
           if (m) {
