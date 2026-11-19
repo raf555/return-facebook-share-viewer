@@ -6,7 +6,7 @@
 // ─── Debug flag ───────────────────────────────────────────────────────────────
 // true  → logs to console + captures graphql responses into window.__feedBodies
 // false → silent
-window.__FBSR_DEBUG = true;
+window.__FBSR_DEBUG = false;
 
 // ─── Network intercept ────────────────────────────────────────────────────────
 // Runs at document_start before FB's own scripts. Patches XHR to read every
@@ -431,32 +431,40 @@ function fbsrMain() {
 
   function getFeedbackTarget(article) {
     // Standalone pages: target comes from the URL (one post per page)
+    // The photo/video viewer renders its post outside [role="main"], both as a
+    // dialog over the feed and as a standalone page. Feed posts inside main
+    // never belong to the URL, even when the viewer opens over them.
     const path = location.pathname;
-    if (path.startsWith('/watch')) {
-      const v = new URLSearchParams(location.search).get('v');
-      if (v) return v;
+    const urlIsOurs = !article.closest('[role="main"]');
+    if (urlIsOurs) {
+      if (path.startsWith('/watch')) {
+        const v = new URLSearchParams(location.search).get('v');
+        if (v) return v;
+      }
+      if (path.startsWith('/photo')) {
+        const fbid = new URLSearchParams(location.search).get('fbid');
+        if (fbid) return fbid;
+      }
+      if (path.startsWith('/reel/')) {
+        const m = path.match(/^\/reel\/(\d+)/);
+        if (m) return m[1];
+      }
+      // /<user>/videos/<id> — profile video pages
+      {
+        const m = path.match(/\/videos\/(\d+)/);
+        if (m) return m[1];
+      }
     }
-    if (path.startsWith('/photo')) {
-      const fbid = new URLSearchParams(location.search).get('fbid');
-      if (fbid) return fbid;
-    }
-    if (path.startsWith('/reel/')) {
-      const m = path.match(/^\/reel\/(\d+)/);
-      if (m) return m[1];
-    }
-    // /<user>/videos/<id> — profile video pages
-    {
-      const m = path.match(/\/videos\/(\d+)/);
-      if (m) return m[1];
-    }
+    const html = article.outerHTML;
+
     // /groups/<gid>/?multi_permalinks=<postId> — group single-post permalink
-    // (alternative format alongside /groups/<gid>/posts/<id>/)
+    // (alternative format alongside /groups/<gid>/posts/<id>/). FB opens it as
+    // a dialog over the group feed, so only the post that links to its own id
+    // is the permalinked one; every other post on the page falls through.
     if (path.startsWith('/groups/')) {
       const mp = new URLSearchParams(location.search).get('multi_permalinks');
-      if (mp) return mp;
+      if (mp && html.includes(mp)) return mp;
     }
-
-    const html = article.outerHTML;
 
     // 1. pfbid in DOM. When this article is a reshare, the embedded original
     //    may have its own pfbid hydrated into the DOM (when the user hovers
