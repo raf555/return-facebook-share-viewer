@@ -6,7 +6,7 @@
 // ─── Debug flag ───────────────────────────────────────────────────────────────
 // true  → logs to console + captures graphql responses into window.__feedBodies
 // false → silent
-window.__FBSR_DEBUG = false;
+window.__FBSR_DEBUG = true;
 
 // ─── Network intercept ────────────────────────────────────────────────────────
 // Runs at document_start before FB's own scripts. Patches XHR to read every
@@ -64,13 +64,6 @@ window.__FBSR_DEBUG = false;
       if (target) {
         pfbidMap.set(obj.post_id, target);
 
-        // Attachment IDs: lets us resolve posts whose DOM only exposes a media id
-        for (const att of (obj.attachments || [])) {
-          if (!att) continue;
-          if (att.media && att.media.id) pfbidMap.set(att.media.id, target);
-          if (att.target && att.target.id) pfbidMap.set(att.target.id, target);
-        }
-
         // Group composite key "group:<groupId>:<actorId>":
         // needed when the DOM only exposes /groups/<id>/user/<uid>/ links.
         const pl = obj.permalink_url;
@@ -119,21 +112,17 @@ window.__FBSR_DEBUG = false;
       // Story-based shape (profile timeline, reel pages, etc) — no post_id,
       // but has a feedback.id (base64 of "feedback:<storyId>") and a
       // share_count somewhere within. Extract the storyId and key the count
-      // by it AND by any attachment media ids.
+      // by it. We do NOT index by attachment media ids (video/photo) because
+      // when someone reshares the media, the reshare post's DOM also has
+      // that media id, and mapping it back would show the ORIGINAL's count
+      // on the reshare card.
       if (node.__typename === 'Story' && node.feedback && typeof node.feedback.id === 'string') {
         const decoded = decodeBase64Maybe(node.feedback.id);
         const m = decoded && decoded.match(/^feedback:(\d+)/);
         if (m) {
           const storyId = m[1];
           const count = findShareCount(node);
-          if (count !== null) {
-            shareCountMap.set(storyId, count);
-            for (const att of (node.attachments || [])) {
-              if (!att) continue;
-              if (att.media && att.media.id) shareCountMap.set(att.media.id, count);
-              if (att.target && att.target.id) shareCountMap.set(att.target.id, count);
-            }
-          }
+          if (count !== null) shareCountMap.set(storyId, count);
         }
       }
       for (const k in node) {
@@ -500,13 +489,17 @@ function fbsrMain() {
     //    reshare). The watch/reel link is the post's OWN permalink, so its
     //    id is a valid feedback target.
     //
-    //    To distinguish from a reshare of a video: check for <h5> in the
-    //    article. FB uses <h4> for the outer actor's name and <h5> for the
-    //    embedded original's actor name. So presence of any <h5> means this
-    //    post has an embedded original — likely a reshare where the outer
-    //    timestamp link also points to the original video (FB quirk). In
-    //    that case the watch id belongs to the original, not the reshare.
-    if (pfbidAnchors.length === 0 && !article.querySelector('h5')) {
+    //    To distinguish from a reshare of a video: FB uses <h4> for the outer
+    //    actor's name and <h5> for an embedded original's actor name on most
+    //    layouts. Reel reshares use a fancy card with <h3> + a link with
+    //    aria-label="See owner profile", AND the reel anchor itself has
+    //    aria-label="Open reel in Reels Viewer". So we treat any of these as
+    //    "embedded original present" → skip the watch/reel id.
+    const hasEmbeddedOriginal =
+      article.querySelector('h5') ||
+      article.querySelector('a[aria-label="See owner profile"]') ||
+      article.querySelector('a[aria-label^="Open reel"]');
+    if (pfbidAnchors.length === 0 && !hasEmbeddedOriginal) {
       const mediaLink = article.querySelector(
         'a[href*="/watch/?v="], a[href*="/watch?v="], a[href*="/reel/"]'
       );
@@ -603,6 +596,9 @@ function fbsrMain() {
   let processed = new WeakSet();
   let retryScheduled = new WeakSet();
   let hydrationWatched = new WeakSet();
+  // article → target that resolved to 0 shares. Hydration retries keep firing
+  // on every DOM mutation, so skip until the article resolves to a new target.
+  let zeroTargets = new WeakMap();
   let postCounter = 0;
 
   // Called when the URL changes (SPA navigation). Wipes per-post state and
@@ -613,6 +609,7 @@ function fbsrMain() {
     processed = new WeakSet();
     retryScheduled = new WeakSet();
     hydrationWatched = new WeakSet();
+    zeroTargets = new WeakMap();
     for (const el of document.querySelectorAll('.fbsr-link-container')) el.remove();
     log('state reset');
   }
@@ -669,8 +666,12 @@ function fbsrMain() {
     if (/^(Comment|Reply) by/i.test(aria)) return;
     processed.add(article);
 
-    const idx = ++postCounter;
     const target = getFeedbackTarget(article);
+    if (target && zeroTargets.get(article) === target) {
+      processed.delete(article);
+      return;
+    }
+    const idx = ++postCounter;
 
     if (!target) {
       log(`#${idx}: no target, will retry on hydration`);
@@ -696,6 +697,7 @@ function fbsrMain() {
         } else {
           count = data && data.data && data.data.feedback &&
             data.data.feedback.reshares && data.data.feedback.reshares.count;
+          if (scMap && typeof count === 'number') scMap.set(target, count);
         }
       } catch (e) {
         err(`#${idx}: tooltip query failed, trying DOM fallback`, e);
@@ -723,6 +725,7 @@ function fbsrMain() {
       // The target might have been wrong (e.g. resolved via a stale map entry
       // before the post's real pfbid hydrated). Keep watching for hydration
       // so a later mutation can re-process with a better target.
+      zeroTargets.set(article, target);
       processed.delete(article);
       setupRetry(article, idx);
       return;
@@ -1122,10 +1125,12 @@ function fbsrMain() {
       shareStory.comet_sections.actor_photo.story.actors[0];
     if (!actor) { warn('buildSharerCard: missing actor'); return null; }
 
-    let creationTime = null, privacyDesc = null, privacyIconName = null;
+    let creationTime = null, timestampHref = null, privacyDesc = null, privacyIconName = null;
     for (const m of (shareStory.comet_sections && shareStory.comet_sections.metadata || [])) {
-      if (m.__typename === 'CometFeedStoryLongerTimestampStrategy' && m.story && m.story.creation_time) {
+      // FB has shipped both Longer- and MinimizedTimestampStrategy here
+      if (/TimestampStrategy$/.test(m.__typename) && m.story && m.story.creation_time) {
         creationTime = m.story.creation_time;
+        timestampHref = m.story.url || null;
       } else if (m.__typename === 'CometFeedStoryAudienceStrategy' && m.story && m.story.privacy_scope) {
         privacyDesc = m.story.privacy_scope.description;
         privacyIconName = m.story.privacy_scope.icon_image && m.story.privacy_scope.icon_image.name;
@@ -1143,7 +1148,7 @@ function fbsrMain() {
       node.comet_sections.content.story.attachments && node.comet_sections.content.story.attachments.length ||
       node.attached_story);
     const profileHref = actor.profile_url || actor.url || '#';
-    const postHref = node.permalink_url || '#';
+    const postHref = node.permalink_url || timestampHref || '#';
 
     const card = document.createElement('div');
     card.className = 'fbsr-sharer-card';
@@ -1191,6 +1196,7 @@ function fbsrMain() {
       ts.className = 'fbsr-sharer-timestamp'; ts.href = postHref;
       ts.target = '_blank'; ts.rel = 'noopener noreferrer';
       ts.textContent = formatRelativeTime(creationTime);
+      ts.title = new Date(creationTime * 1000).toLocaleString();
       metaRow.appendChild(ts);
     }
     if (privacyIconName || privacyDesc) {
