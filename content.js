@@ -342,7 +342,9 @@ function fbsrMain() {
     try {
       const url = new URL(href, location.origin);
       if (url.hostname && !url.hostname.endsWith('facebook.com')) return null;
-      if (url.pathname === '/profile.php') {
+      // /permalink.php and /story.php carry the poster's numeric id in ?id=,
+      // which is how posts by profile.php users (no username) link to themselves
+      if (url.pathname === '/profile.php' || url.pathname === '/permalink.php' || url.pathname === '/story.php') {
         const id = url.searchParams.get('id');
         return id ? `id:${id}` : null;
       }
@@ -599,6 +601,7 @@ function fbsrMain() {
   // article → target that resolved to 0 shares. Hydration retries keep firing
   // on every DOM mutation, so skip until the article resolves to a new target.
   let zeroTargets = new WeakMap();
+  let hydrationTried = new WeakSet();
   let postCounter = 0;
 
   // Called when the URL changes (SPA navigation). Wipes per-post state and
@@ -610,6 +613,7 @@ function fbsrMain() {
     retryScheduled = new WeakSet();
     hydrationWatched = new WeakSet();
     zeroTargets = new WeakMap();
+    hydrationTried = new WeakSet();
     for (const el of document.querySelectorAll('.fbsr-link-container')) el.remove();
     log('state reset');
   }
@@ -657,6 +661,22 @@ function fbsrMain() {
     }
   }
 
+  // FB renders the timestamp link as href="?__cft__..." and only swaps in the
+  // real permalink (with the pfbid) on hover or focus. Focusing it does the
+  // same without showing the date tooltip; setupRetry's observer then picks up
+  // the new href. Skipped while anything else has focus so we never pull focus
+  // out of a comment box.
+  function hydrateTimestamp(article) {
+    if (hydrationTried.has(article)) return;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    const ts = article.querySelector('a[href^="?"]');
+    if (!ts) return;
+    hydrationTried.add(article);
+    ts.focus({ preventScroll: true });
+    ts.blur();
+  }
+
   // ── processPost ──────────────────────────────────────────────────────────────
 
   async function processPost(article) {
@@ -677,6 +697,7 @@ function fbsrMain() {
       log(`#${idx}: no target, will retry on hydration`);
       processed.delete(article);
       setupRetry(article, idx);
+      hydrateTimestamp(article);
       return;
     }
 

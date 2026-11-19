@@ -7,7 +7,8 @@
     {
       "matches": [
         "*://www.facebook.com/*",
-        "*://facebook.com/*"
+        "*://facebook.com/*",
+        "*://web.facebook.com/*"
       ],
       "js": [
         "content.js"
