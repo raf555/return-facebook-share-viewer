@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.5.0 (no leading v)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check version
+        run: |
+          # Chrome accepts 1-4 dot-separated integers, so 1.2.3-beta can't ship
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]]; then
+            echo "::error::$VERSION is not a valid extension version (expected X.Y.Z)"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+
+      - name: Check debug logging is off
+        run: |
+          if ! grep -q '^window.__FBSR_DEBUG = false;' content.js; then
+            echo "::error::content.js must ship with window.__FBSR_DEBUG = false;"
+            exit 1
+          fi
+
+      - name: Commit version bump and tag it
+        run: |
+          .github/set-version.sh manifest.json "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git commit -am "bump version to $VERSION"
+          fi
+          git tag "$TAG"
+          # Atomic so main and the tag either both land or neither does
+          git push --atomic origin HEAD:main "refs/tags/$TAG"
+
+      - name: Build extension zip
+        run: |
+          zip_name="return-facebook-share-viewer-${TAG}.zip"
+          zip -r "$zip_name" manifest.json content.js styles.css assets LICENSE README.md
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" "$ZIP_NAME" \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file .github/release-notes.md \
+            --generate-notes
