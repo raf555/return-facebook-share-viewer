@@ -64,13 +64,6 @@ window.__FBSR_DEBUG = false;
       if (target) {
         pfbidMap.set(obj.post_id, target);
 
-        // Attachment IDs: lets us resolve posts whose DOM only exposes a media id
-        for (const att of (obj.attachments || [])) {
-          if (!att) continue;
-          if (att.media && att.media.id) pfbidMap.set(att.media.id, target);
-          if (att.target && att.target.id) pfbidMap.set(att.target.id, target);
-        }
-
         // Group composite key "group:<groupId>:<actorId>":
         // needed when the DOM only exposes /groups/<id>/user/<uid>/ links.
         const pl = obj.permalink_url;
@@ -116,6 +109,22 @@ window.__FBSR_DEBUG = false;
           if (count !== null) shareCountMap.set(target, count);
         }
       }
+      // Story-based shape (profile timeline, reel pages, etc) — no post_id,
+      // but has a feedback.id (base64 of "feedback:<storyId>") and a
+      // share_count somewhere within. Extract the storyId and key the count
+      // by it. We do NOT index by attachment media ids (video/photo) because
+      // when someone reshares the media, the reshare post's DOM also has
+      // that media id, and mapping it back would show the ORIGINAL's count
+      // on the reshare card.
+      if (node.__typename === 'Story' && node.feedback && typeof node.feedback.id === 'string') {
+        const decoded = decodeBase64Maybe(node.feedback.id);
+        const m = decoded && decoded.match(/^feedback:(\d+)/);
+        if (m) {
+          const storyId = m[1];
+          const count = findShareCount(node);
+          if (count !== null) shareCountMap.set(storyId, count);
+        }
+      }
       for (const k in node) {
         if (k === 'attached_story') continue;
         if (node[k] && typeof node[k] === 'object') visit(node[k]);
@@ -124,8 +133,19 @@ window.__FBSR_DEBUG = false;
     visit(obj);
   }
 
+  function decodeBase64Maybe(s) {
+    if (!s || typeof s !== 'string') return null;
+    if (!/^[A-Za-z0-9+/=]+$/.test(s)) return null;
+    try { return atob(s); } catch (e) { return null; }
+  }
+
   function onGraphQLResponse(text) {
-    if (!text || (text.indexOf('pfbid') === -1 && text.indexOf('/groups/') === -1)) return;
+    if (!text) return;
+    // Loose gate: process if there's anything indexable. Profile timeline
+    // responses have no pfbid (Story-based shape) but do contain share_count.
+    if (text.indexOf('pfbid') === -1 &&
+        text.indexOf('/groups/') === -1 &&
+        text.indexOf('share_count') === -1) return;
     const before = pfbidMap.size;
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
@@ -314,48 +334,205 @@ function fbsrMain() {
   // ── Post identification ──────────────────────────────────────────────────────
   // Returns a feedback target for the given post container, or null.
 
+  // Extracts the FB profile slug from a facebook.com URL.
+  // Returns "username" for /username/... or "id:123" for /profile.php?id=123.
+  // Returns null if the URL doesn't identify a profile.
+  function extractSlugFromHref(href) {
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.origin);
+      if (url.hostname && !url.hostname.endsWith('facebook.com')) return null;
+      // /permalink.php and /story.php carry the poster's numeric id in ?id=,
+      // which is how posts by profile.php users (no username) link to themselves
+      if (url.pathname === '/profile.php' || url.pathname === '/permalink.php' || url.pathname === '/story.php') {
+        const id = url.searchParams.get('id');
+        return id ? `id:${id}` : null;
+      }
+      const m = url.pathname.match(/^\/([^/]+)/);
+      if (!m) return null;
+      const seg = m[1];
+      // Skip FB system routes — these aren't user slugs
+      const reserved = new Set([
+        'photo', 'photos', 'watch', 'reel', 'groups', 'pages', 'events',
+        'marketplace', 'gaming', 'stories', 'permalink.php', 'story.php',
+        'home.php', 'profile.php', 'public', 'pg', 'people', 'video',
+        'videos', 'help', 'business', 'login', 'logout', 'settings',
+      ]);
+      if (reserved.has(seg)) return null;
+      return seg;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Returns the resharer/poster's profile slug — the user whose name appears
+  // at the top of the post. We use [data-ad-rendering-role="profile_name"]
+  // which FB places exactly on the OUTER actor's name container, not on any
+  // embedded original's actor. Falls back to the first profile-style link if
+  // the rendering role isn't present (older layouts).
+  function getActorSlug(article) {
+    const nameEl = article.querySelector('[data-ad-rendering-role="profile_name"]');
+    if (nameEl) {
+      const a = nameEl.querySelector('a[href]');
+      if (a) {
+        const slug = extractSlugFromHref(a.getAttribute('href'));
+        if (slug) return slug;
+      }
+    }
+    // Fallback: first role=link anchor that resolves to a profile slug.
+    for (const a of article.querySelectorAll('a[role="link"][href]')) {
+      const slug = extractSlugFromHref(a.getAttribute('href'));
+      if (slug) return slug;
+    }
+    return null;
+  }
+
+  // Reads the share count from server-rendered inline scripts without
+  // calling the API. Used as a fallback when the API is rate-limited.
+  // Searches for "share_count":{"count":N} within 2KB of the target id.
+  function readNativeShareCount(article, target) {
+    if (!target) return null;
+    for (const s of document.querySelectorAll('script:not([src])')) {
+      const txt = s.textContent;
+      if (!txt || txt.indexOf('share_count') === -1) continue;
+      // Find each occurrence of the target id, then look for a share_count
+      // nearby (in either direction since FB JSON ordering varies).
+      let pos = 0;
+      while ((pos = txt.indexOf(String(target), pos)) !== -1) {
+        const ctx = txt.slice(Math.max(0, pos - 2000), pos + 2000);
+        const m = ctx.match(/"share_count":\{"count":(\d+)\}/);
+        if (m) return parseInt(m[1], 10);
+        pos += String(target).length;
+      }
+    }
+    // DOM fallback, tightly scoped: find a number ONLY inside the share
+    // button's own aria-label wrapper, never inside sibling Like/Comment
+    // wrappers. FB renders each action as a [aria-label="..."] container
+    // with the number span as a child; for shares, the wrapper has
+    // aria-label="Send this to friends or post it on your profile."
+    const shareBtn = article.querySelector('[data-ad-rendering-role="share_button"]');
+    if (shareBtn) {
+      let wrapper = shareBtn.closest('[aria-label]');
+      if (wrapper) {
+        for (const span of wrapper.querySelectorAll('span[dir="auto"]')) {
+          const txt = span.textContent.trim();
+          const m = txt.match(/^([\d,.]+)\s*([KMk]?)$/);
+          if (m) {
+            let n = parseFloat(m[1].replace(/,/g, ''));
+            if (m[2].toUpperCase() === 'K') n *= 1000;
+            if (m[2].toUpperCase() === 'M') n *= 1000000;
+            if (n > 0) return Math.round(n);
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   function getFeedbackTarget(article) {
     // Standalone pages: target comes from the URL (one post per page)
+    // The photo/video viewer renders its post outside [role="main"], both as a
+    // dialog over the feed and as a standalone page. Feed posts inside main
+    // never belong to the URL, even when the viewer opens over them.
     const path = location.pathname;
-    if (path.startsWith('/watch')) {
-      const v = new URLSearchParams(location.search).get('v');
-      if (v) return v;
+    const urlIsOurs = !article.closest('[role="main"]');
+    if (urlIsOurs) {
+      if (path.startsWith('/watch')) {
+        const v = new URLSearchParams(location.search).get('v');
+        if (v) return v;
+      }
+      if (path.startsWith('/photo')) {
+        const fbid = new URLSearchParams(location.search).get('fbid');
+        if (fbid) return fbid;
+      }
+      if (path.startsWith('/reel/')) {
+        const m = path.match(/^\/reel\/(\d+)/);
+        if (m) return m[1];
+      }
+      // /<user>/videos/<id> — profile video pages
+      {
+        const m = path.match(/\/videos\/(\d+)/);
+        if (m) return m[1];
+      }
     }
-    if (path.startsWith('/photo')) {
-      const fbid = new URLSearchParams(location.search).get('fbid');
-      if (fbid) return fbid;
-    }
-    if (path.startsWith('/reel/')) {
-      const m = path.match(/^\/reel\/(\d+)/);
-      if (m) return m[1];
-    }
-    // /<user>/videos/<id> — profile video pages
-    {
-      const m = path.match(/\/videos\/(\d+)/);
-      if (m) return m[1];
-    }
-
     const html = article.outerHTML;
 
-    // 1. pfbid in DOM (simple regex — fast path, works for most posts)
-    const pfbid = html.match(/pfbid[A-Za-z0-9]+/);
-    if (pfbid) return pfbid[0];
+    // /groups/<gid>/?multi_permalinks=<postId> — group single-post permalink
+    // (alternative format alongside /groups/<gid>/posts/<id>/). FB opens it as
+    // a dialog over the group feed, so only the post that links to its own id
+    // is the permalinked one; every other post on the page falls through.
+    if (path.startsWith('/groups/')) {
+      const mp = new URLSearchParams(location.search).get('multi_permalinks');
+      if (mp && html.includes(mp)) return mp;
+    }
+
+    // 1. pfbid in DOM. When this article is a reshare, the embedded original
+    //    may have its own pfbid hydrated into the DOM (when the user hovers
+    //    it). That pfbid belongs to a DIFFERENT user. Using it would show the
+    //    original's share count on the reshare card.
+    //
+    //    Fix: find the resharer's profile slug (first actor link in the
+    //    article header) and only accept pfbid anchors whose URL slug matches.
+    //    If none match, fall through to map-based lookups.
+    const pfbidAnchors = article.querySelectorAll('a[href*="pfbid"]');
+    if (pfbidAnchors.length > 0) {
+      const resharerSlug = getActorSlug(article);
+      for (const a of pfbidAnchors) {
+        const href = a.getAttribute('href') || '';
+        const pfbid = (href.match(/pfbid[A-Za-z0-9]+/) || [])[0];
+        if (!pfbid) continue;
+        // If we couldn't determine the resharer, fall back to first pfbid
+        // (preserves old behavior for posts without a clear actor link).
+        if (!resharerSlug) return pfbid;
+        const linkSlug = extractSlugFromHref(href);
+        if (linkSlug && linkSlug === resharerSlug) return pfbid;
+      }
+      // pfbid anchors exist but none match the resharer — they belong to
+      // the embedded original. Don't use them. Fall through.
+    }
 
     // 2. Group post: explicit numeric id in permalink
     const groupPost = html.match(/\/groups\/[^/]+\/posts\/(\d+)/);
     if (groupPost) return groupPost[1];
 
+    // 3. Direct video/reel post (uploaded by the actor themselves, not a
+    //    reshare). The watch/reel link is the post's OWN permalink, so its
+    //    id is a valid feedback target.
+    //
+    //    To distinguish from a reshare of a video: FB uses <h4> for the outer
+    //    actor's name and <h5> for an embedded original's actor name on most
+    //    layouts. Reel reshares use a fancy card with <h3> + a link with
+    //    aria-label="See owner profile", AND the reel anchor itself has
+    //    aria-label="Open reel in Reels Viewer". So we treat any of these as
+    //    "embedded original present" → skip the watch/reel id.
+    const hasEmbeddedOriginal =
+      article.querySelector('h5') ||
+      article.querySelector('a[aria-label="See owner profile"]') ||
+      article.querySelector('a[aria-label^="Open reel"]');
+    if (pfbidAnchors.length === 0 && !hasEmbeddedOriginal) {
+      const mediaLink = article.querySelector(
+        'a[href*="/watch/?v="], a[href*="/watch?v="], a[href*="/reel/"]'
+      );
+      if (mediaLink) {
+        const href = mediaLink.getAttribute('href') || '';
+        const watch = href.match(/[?&]v=(\d+)/);
+        if (watch) return watch[1];
+        const reel = href.match(/\/reel\/(\d+)/);
+        if (reel) return reel[1];
+      }
+    }
+
     const map = window.__fbsrPfbidMap;
     if (!map || !map.size) return null;
 
-    // 3. Group composite key from /groups/<id>/user/<uid>/ DOM links
+    // 4. Group composite key from /groups/<id>/user/<uid>/ DOM links
     const groupUser = html.match(/\/groups\/(\d+)\/user\/(\d+)\//);
     if (groupUser) {
       const t = map.get(`group:${groupUser[1]}:${groupUser[2]}`);
       if (t) return t;
     }
 
-    // 4. Any long numeric ID in the DOM matched against pfbidMap
+    // 5. Any long numeric ID in the DOM matched against pfbidMap
     for (const id of new Set(html.match(/\b\d{14,20}\b/g) || [])) {
       const t = map.get(id);
       if (t) return t;
@@ -373,21 +550,41 @@ function fbsrMain() {
       /\/videos\/\d+/.test(location.pathname);
 
     for (const sb of root.querySelectorAll('[data-ad-rendering-role="share_button"]')) {
+      // Walk up from the share button to find the smallest ancestor that
+      // logically contains ONE post. Three cases:
+      //   1. Normal post: the story_message/actions ancestor contains exactly
+      //      one profile_name — that's the per-post scope.
+      //   2. Multi-share (e.g. "X and Y shared a photo"): the outer container
+      //      has multiple profile_names but each share button has its own
+      //      inner section with exactly one profile_name. We pick that
+      //      inner section so each share button gets its own target.
+      //   3. Fallback: any ancestor with story_message / story-actions.
       let el = sb;
-      let found = false;
+      let scoped = null;        // smallest ancestor with exactly 1 profile_name
+      let storyAncestor = null; // any ancestor with story_message — fallback
       for (let i = 0; i < 15 && el; i++) {
         el = el.parentElement;
         if (!el) break;
-        if (el.querySelector('[data-ad-rendering-role="story_message"]') ||
-          el.querySelector('[data-ad-preview="message"]') ||
-          el.querySelector('[aria-label^="Actions for this post"]')) {
-          containers.add(el);
-          found = true;
-          break;
+        if (!scoped) {
+          const names = el.querySelectorAll('[data-ad-rendering-role="profile_name"]');
+          if (names.length === 1) scoped = el;
         }
+        if (!storyAncestor && (
+          el.querySelector('[data-ad-rendering-role="story_message"]') ||
+          el.querySelector('[data-ad-preview="message"]') ||
+          el.querySelector('[aria-label^="Actions for this post"]')
+        )) {
+          storyAncestor = el;
+        }
+        if (scoped && storyAncestor) break;
+      }
+      const container = scoped || storyAncestor;
+      if (container) {
+        containers.add(container);
+        continue;
       }
       // Standalone-page fallback: use the action-row ancestor
-      if (!found && isStandalone) {
+      if (isStandalone) {
         let cur = sb;
         for (let i = 0; i < 6 && cur; i++) {
           cur = cur.parentElement;
@@ -409,6 +606,10 @@ function fbsrMain() {
   let processed = new WeakSet();
   let retryScheduled = new WeakSet();
   let hydrationWatched = new WeakSet();
+  // article → target that resolved to 0 shares. Hydration retries keep firing
+  // on every DOM mutation, so skip until the article resolves to a new target.
+  let zeroTargets = new WeakMap();
+  let hydrationTried = new WeakSet();
   let postCounter = 0;
 
   // Called when the URL changes (SPA navigation). Wipes per-post state and
@@ -419,19 +620,26 @@ function fbsrMain() {
     processed = new WeakSet();
     retryScheduled = new WeakSet();
     hydrationWatched = new WeakSet();
+    zeroTargets = new WeakMap();
+    hydrationTried = new WeakSet();
     for (const el of document.querySelectorAll('.fbsr-link-container')) el.remove();
     log('state reset');
   }
 
   function setupRetry(article, idx) {
-    // MutationObserver: re-run when an outer pfbid hydrates into the DOM.
-    // "Outer" means NOT inside a <blockquote> (the embedded original's wrapper)
-    // so hovering the embedded post doesn't incorrectly trigger re-processing.
+    // MutationObserver: re-run processPost on any href hydration. Keep the
+    // observer alive until a link is actually injected — that way, if the
+    // first hydration produced a wrong target (e.g. the embedded original's
+    // pfbid, rejected by slug-matching), we keep watching for the resharer's
+    // own pfbid to hydrate later.
     if (!hydrationWatched.has(article)) {
       hydrationWatched.add(article);
-      let fired = false;
       const mo = new MutationObserver(() => {
-        if (fired) return;
+        // Stop watching once a link is injected
+        if (article.querySelector('.fbsr-link-container')) {
+          mo.disconnect();
+          return;
+        }
         let hasOuterPfbid = false;
         for (const a of article.querySelectorAll('a[href*="pfbid"]')) {
           let inBQ = false, p = a.parentElement;
@@ -439,8 +647,6 @@ function fbsrMain() {
           if (!inBQ) { hasOuterPfbid = true; break; }
         }
         if (!hasOuterPfbid && !/\/groups\/[^/]+\/posts\/\d+/.test(article.outerHTML)) return;
-        fired = true;
-        mo.disconnect();
         log(`#${idx}: hydration detected, re-processing`);
         processed.delete(article);
         processPost(article);
@@ -463,6 +669,22 @@ function fbsrMain() {
     }
   }
 
+  // FB renders the timestamp link as href="?__cft__..." and only swaps in the
+  // real permalink (with the pfbid) on hover or focus. Focusing it does the
+  // same without showing the date tooltip; setupRetry's observer then picks up
+  // the new href. Skipped while anything else has focus so we never pull focus
+  // out of a comment box.
+  function hydrateTimestamp(article) {
+    if (hydrationTried.has(article)) return;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    const ts = article.querySelector('a[href^="?"]');
+    if (!ts) return;
+    hydrationTried.add(article);
+    ts.focus({ preventScroll: true });
+    ts.blur();
+  }
+
   // ── processPost ──────────────────────────────────────────────────────────────
 
   async function processPost(article) {
@@ -472,13 +694,18 @@ function fbsrMain() {
     if (/^(Comment|Reply) by/i.test(aria)) return;
     processed.add(article);
 
-    const idx = ++postCounter;
     const target = getFeedbackTarget(article);
+    if (target && zeroTargets.get(article) === target) {
+      processed.delete(article);
+      return;
+    }
+    const idx = ++postCounter;
 
     if (!target) {
       log(`#${idx}: no target, will retry on hydration`);
       processed.delete(article);
       setupRetry(article, idx);
+      hydrateTimestamp(article);
       return;
     }
 
@@ -488,18 +715,48 @@ function fbsrMain() {
     const scMap = window.__fbsrShareCountMap;
     let count = scMap && scMap.get(target);
     if (typeof count !== 'number') {
+      let apiFailed = false;
       try {
         const data = await queryTooltip(target);
-        count = data && data.data && data.data.feedback &&
-          data.data.feedback.reshares && data.data.feedback.reshares.count;
+        if (data && data.errors && !data.data) {
+          // API returned errors (rate limit, permission, etc) — fall back
+          const code = data.errors[0] && data.errors[0].code;
+          warn(`#${idx}: API error (code=${code}), trying DOM fallback`);
+          apiFailed = true;
+        } else {
+          count = data && data.data && data.data.feedback &&
+            data.data.feedback.reshares && data.data.feedback.reshares.count;
+          if (scMap && typeof count === 'number') scMap.set(target, count);
+        }
       } catch (e) {
-        err(`#${idx}: tooltip query failed`, e);
-        return;
+        err(`#${idx}: tooltip query failed, trying DOM fallback`, e);
+        apiFailed = true;
+      }
+      if (apiFailed) {
+        // Read share count from page's inline JSON (server-rendered).
+        // Tooltip + modal will still fail while rate-limited, but at least
+        // the link appears with the right count and is clickable.
+        const native = readNativeShareCount(article, target);
+        if (typeof native === 'number' && native > 0) {
+          log(`#${idx}: got count ${native} from DOM fallback`);
+          count = native;
+        } else {
+          // No fallback available — retry later
+          processed.delete(article);
+          setupRetry(article, idx);
+          return;
+        }
       }
     }
 
     if (!count || count <= 0) {
       log(`#${idx}: ${count} shares, skipping`);
+      // The target might have been wrong (e.g. resolved via a stale map entry
+      // before the post's real pfbid hydrated). Keep watching for hydration
+      // so a later mutation can re-process with a better target.
+      zeroTargets.set(article, target);
+      processed.delete(article);
+      setupRetry(article, idx);
       return;
     }
 
@@ -897,10 +1154,12 @@ function fbsrMain() {
       shareStory.comet_sections.actor_photo.story.actors[0];
     if (!actor) { warn('buildSharerCard: missing actor'); return null; }
 
-    let creationTime = null, privacyDesc = null, privacyIconName = null;
+    let creationTime = null, timestampHref = null, privacyDesc = null, privacyIconName = null;
     for (const m of (shareStory.comet_sections && shareStory.comet_sections.metadata || [])) {
-      if (m.__typename === 'CometFeedStoryLongerTimestampStrategy' && m.story && m.story.creation_time) {
+      // FB has shipped both Longer- and MinimizedTimestampStrategy here
+      if (/TimestampStrategy$/.test(m.__typename) && m.story && m.story.creation_time) {
         creationTime = m.story.creation_time;
+        timestampHref = m.story.url || null;
       } else if (m.__typename === 'CometFeedStoryAudienceStrategy' && m.story && m.story.privacy_scope) {
         privacyDesc = m.story.privacy_scope.description;
         privacyIconName = m.story.privacy_scope.icon_image && m.story.privacy_scope.icon_image.name;
@@ -918,7 +1177,7 @@ function fbsrMain() {
       node.comet_sections.content.story.attachments && node.comet_sections.content.story.attachments.length ||
       node.attached_story);
     const profileHref = actor.profile_url || actor.url || '#';
-    const postHref = node.permalink_url || '#';
+    const postHref = node.permalink_url || timestampHref || '#';
 
     const card = document.createElement('div');
     card.className = 'fbsr-sharer-card';
@@ -966,6 +1225,7 @@ function fbsrMain() {
       ts.className = 'fbsr-sharer-timestamp'; ts.href = postHref;
       ts.target = '_blank'; ts.rel = 'noopener noreferrer';
       ts.textContent = formatRelativeTime(creationTime);
+      ts.title = new Date(creationTime * 1000).toLocaleString();
       metaRow.appendChild(ts);
     }
     if (privacyIconName || privacyDesc) {
