@@ -1,4 +1,4 @@
-The extension sends no data anywhere except to Facebook itself.
+The extension sends data only to Facebook.
 
 ## Install
 
