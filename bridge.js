@@ -24,4 +24,6 @@ document.addEventListener('fbsr:settings-request', send);
 chrome.storage.local.get(DEFAULTS).then((s) => {
   settingsJson = JSON.stringify(s);
   send();
+  // The popup compares against this to decide whether Facebook needs a reload.
+  chrome.storage.local.set({ applied: s });
 });

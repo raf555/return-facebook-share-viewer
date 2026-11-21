@@ -257,9 +257,9 @@ document.dispatchEvent(new CustomEvent('fbsr:settings-request'));
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 function fbsrMain() {
-  const DEBUG = window.__FBSR_DEBUG;
-  const log = (...a) => { if (DEBUG) console.log('[FBSR]', ...a); };
-  const warn = (...a) => { if (DEBUG) console.warn('[FBSR]', ...a); };
+  // Reads the flag on each call so setting it from the console works mid-session
+  const log = (...a) => { if (window.__FBSR_DEBUG) console.log('[FBSR]', ...a); };
+  const warn = (...a) => { if (window.__FBSR_DEBUG) console.warn('[FBSR]', ...a); };
   const err = (...a) => { console.error('[FBSR]', ...a); };
 
   // ── Tokens ──────────────────────────────────────────────────────────────────

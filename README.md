@@ -11,7 +11,7 @@ It works on your news feed, profiles, pages, groups and photo pages, including p
 3. Turn on **Developer mode** (top right).
 4. Click **Load unpacked** and select the extracted folder.
 
-To update, extract the new zip over the old folder and click the reload icon on the extension's card. Unpacked extensions don't update themselves, but the extension checks GitHub once a day and shows NEW on its toolbar icon when a release is out.
+To update, extract the new zip over the old folder and click the reload icon on the extension's card. Unpacked extensions don't update themselves, but the extension checks GitHub once a day and shows UPD on its toolbar icon when a release is out.
 
 To run from source instead, clone the repo and select its folder in step 4.
 
@@ -82,16 +82,6 @@ Turn on **Debug logging** in the popup and reload Facebook. That enables:
 - Console logging prefixed with `[FBSR]`.
 - A capture of up to 50 recent GraphQL response bodies in `window.__feedBodies`.
 
-The extension reads the setting when the page loads, so setting `window.__FBSR_DEBUG` from the console has no effect. You can also set `window.__FBSR_DEBUG = true` near the top of `content.js` and reload the extension. Keep that line `false` in releases. The release workflow stops with an error if it's `true`.
+To turn it on for one tab without a reload, run `window.__FBSR_DEBUG = true` in that tab's console. Logging and capture start from that point; earlier responses aren't captured. Set it to `false` to stop. You can also set `window.__FBSR_DEBUG = true` near the top of `content.js` and reload the extension. Keep that line `false` in releases. The release workflow stops with an error if it's `true`.
 
 Turn on **Skip inline-script seeding** to stop the extension from reading Facebook's server-rendered posts when you isolate a bug.
-
-## Releasing
-
-Go to **Actions → Release → Run workflow** and enter the new version (for example `0.5.0`). The workflow:
-
-1. Checks the version is valid for Chrome and not already tagged, and that debug mode is off.
-2. Sets the version in `manifest.json` on `main`, commits it, and tags that commit `vX.Y.Z`.
-3. Builds a zip with only the extension's files and publishes a GitHub release with it.
-
-Run `git pull` afterwards to get the version-bump commit.

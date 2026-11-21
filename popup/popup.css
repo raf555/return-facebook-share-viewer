@@ -30,6 +30,9 @@
 
 * { box-sizing: border-box; }
 
+/* Rules like .notice { display: flex } would otherwise override the hidden attribute */
+[hidden] { display: none !important; }
+
 html { overflow-x: hidden; }
 
 body {
@@ -51,6 +54,21 @@ p { margin: 0; }
 }
 
 .head img { border-radius: 6px; }
+
+.repo {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  margin-left: auto;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.repo:hover {
+  color: var(--text);
+  background: var(--surface);
+}
 
 h1 {
   margin: 0;

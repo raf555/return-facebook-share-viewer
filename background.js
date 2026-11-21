@@ -21,7 +21,7 @@ function compareVersions(a, b) {
 async function setBadge(update) {
   const current = chrome.runtime.getManifest().version;
   const newer = update && update.latest && compareVersions(update.latest, current) > 0;
-  await chrome.action.setBadgeText({ text: newer ? 'NEW' : '' });
+  await chrome.action.setBadgeText({ text: newer ? 'UPD' : '' });
   if (newer) await chrome.action.setBadgeBackgroundColor({ color: '#0861e0' });
 }
 

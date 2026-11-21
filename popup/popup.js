@@ -67,6 +67,21 @@ function renderUpdate(update) {
   statusEl.textContent = `Up to date. Checked ${ago(update.checkedAt)}.`;
 }
 
+// Settings content.js reads at page load. updateCheck lives in the service
+// worker and applies at once.
+const PAGE_KEYS = ['enabled', 'debug', 'disableSeeding'];
+
+// Shows the reload notice only when a Facebook tab is open and its settings
+// differ from the saved ones. bridge.js stores what the last page load got as
+// `applied`. Until a page has loaded once there's nothing to compare, so the
+// notice stays hidden.
+async function refreshNotice() {
+  const s = await chrome.storage.local.get({ ...DEFAULTS, applied: null });
+  const stale = s.applied !== null && PAGE_KEYS.some((k) => s.applied[k] !== s[k]);
+  const tabs = stale ? await chrome.tabs.query({ url: FB_TABS }) : [];
+  document.getElementById('reload-notice').hidden = tabs.length === 0;
+}
+
 async function init() {
   const stored = await chrome.storage.local.get({ ...DEFAULTS, update: null });
   for (const input of document.querySelectorAll('input[data-key]')) {
@@ -75,8 +90,7 @@ async function init() {
       try {
         await chrome.storage.local.set({ [input.dataset.key]: input.checked });
         showError('');
-        // updateCheck lives in the service worker; the rest need a page reload.
-        if (input.dataset.key !== 'updateCheck') document.getElementById('reload-notice').hidden = false;
+        await refreshNotice();
       } catch (e) {
         input.checked = !input.checked;
         showError(`Couldn't save: ${e.message}`);
@@ -84,7 +98,13 @@ async function init() {
     });
   }
   renderUpdate(stored.update);
+  await refreshNotice();
 }
+
+// Reloaded tabs write `applied`, which can hide the notice while the popup is open.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && 'applied' in changes) refreshNotice();
+});
 
 checkBtn.addEventListener('click', async () => {
   checkBtn.disabled = true;
