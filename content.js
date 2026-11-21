@@ -6,7 +6,29 @@
 // ─── Debug flag ───────────────────────────────────────────────────────────────
 // true  → logs to console + captures graphql responses into window.__feedBodies
 // false → silent
+// The popup's "Debug logging" switch also turns this on (see Settings below).
 window.__FBSR_DEBUG = false;
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+// This script runs in the MAIN world, which has no chrome.storage. bridge.js
+// runs in the ISOLATED world, reads the popup's settings and sends them here
+// as a JSON string on a document event. Whichever script loads first, one of
+// the two sends reaches the other: bridge.js pushes once after reading
+// storage, and answers each fbsr:settings-request.
+window.__fbsrSettingsReady = new Promise((resolve) => {
+  document.addEventListener('fbsr:settings', (e) => {
+    let s;
+    try { s = JSON.parse(e.detail); } catch (err) { return; }
+    window.__FBSR_OFF = !s.enabled;
+    if (s.debug) window.__FBSR_DEBUG = true;
+    if (s.disableSeeding) window.__FBSR_DISABLE_SEEDING = true;
+    resolve();
+  });
+  // Without a reply (bridge.js missing, or orphaned after the extension
+  // reloaded), run with the defaults above.
+  setTimeout(resolve, 2000);
+});
+document.dispatchEvent(new CustomEvent('fbsr:settings-request'));
 
 // ─── Network intercept ────────────────────────────────────────────────────────
 // Runs at document_start before FB's own scripts. Patches XHR to read every
@@ -140,7 +162,7 @@ window.__FBSR_DEBUG = false;
   }
 
   function onGraphQLResponse(text) {
-    if (!text) return;
+    if (!text || window.__FBSR_OFF) return;
     // Loose gate: process if there's anything indexable. Profile timeline
     // responses have no pfbid (Story-based shape) but do contain share_count.
     if (text.indexOf('pfbid') === -1 &&
@@ -1528,8 +1550,14 @@ function fbsrMain() {
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', fbsrMain, { once: true });
-} else {
+const fbsrDomReady = document.readyState === 'loading'
+  ? new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }))
+  : Promise.resolve();
+
+Promise.all([fbsrDomReady, window.__fbsrSettingsReady]).then(() => {
+  if (window.__FBSR_OFF) {
+    console.log('[FBSR] turned off in the extension popup');
+    return;
+  }
   fbsrMain();
-}
+});

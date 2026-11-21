@@ -18,7 +18,31 @@
       ],
       "run_at": "document_start",
       "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://www.facebook.com/*",
+        "*://facebook.com/*",
+        "*://web.facebook.com/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_start"
     }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "128": "assets/icon.png"
+    }
+  },
+  "permissions": [
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "*://*.facebook.com/*"

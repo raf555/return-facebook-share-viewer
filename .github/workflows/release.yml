@@ -56,7 +56,7 @@ jobs:
       - name: Build extension zip
         run: |
           zip_name="return-facebook-share-viewer-${TAG}.zip"
-          zip -r "$zip_name" manifest.json content.js styles.css assets LICENSE README.md
+          zip -r "$zip_name" manifest.json content.js bridge.js background.js styles.css popup assets LICENSE README.md
           echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
 
       - name: Create release

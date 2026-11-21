@@ -7,7 +7,7 @@ The extension sends data only to Facebook.
 3. Turn on **Developer mode** (top right).
 4. Click **Load unpacked** and select the extracted folder.
 
-To update, extract the new zip over the old folder and click the reload icon on the extension's card.
+To update, extract the new zip over the old folder and click the reload icon on the extension's card. The toolbar icon shows NEW when a release is out. Click the icon for settings.
 
 ## Usage
 

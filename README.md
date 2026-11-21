@@ -11,7 +11,7 @@ It works on your news feed, profiles, pages, groups and photo pages, including p
 3. Turn on **Developer mode** (top right).
 4. Click **Load unpacked** and select the extracted folder.
 
-To update, extract the new zip over the old folder and click the reload icon on the extension's card. Unpacked extensions don't update themselves.
+To update, extract the new zip over the old folder and click the reload icon on the extension's card. Unpacked extensions don't update themselves, but the extension checks GitHub once a day and shows NEW on its toolbar icon when a release is out.
 
 To run from source instead, clone the repo and select its folder in step 4.
 
@@ -21,6 +21,16 @@ Scroll through your Facebook feed. Each post with at least one share gets an `N 
 
 - **Hover** the link to see the first few sharers' names.
 - **Click** it for the full list of visible sharers, with avatars, captions and privacy. Each sharer's timestamp links to their post.
+
+## Settings
+
+Click the extension's toolbar icon to open its settings:
+
+- **Show share links on Facebook**: turn the extension off without removing it.
+- **Check now** and **Check GitHub once a day**: look for a newer release. A newer version shows a link to its release page.
+- **Debug logging** and **Skip inline-script seeding**: see [Debug mode](#debug-mode).
+
+Facebook tabs read the settings when they load. After you change one, click **Reload Facebook tabs** in the popup, or reload them yourself.
 
 ## How it works
 
@@ -40,6 +50,9 @@ The extension sends data only to Facebook.
 
 - `manifest.json`: Manifest V3. Injects the content script into facebook.com at `document_start` in the MAIN world.
 - `content.js`: all logic (network intercept, token scraping, API calls, DOM observer, link injection, tooltip, modal).
+- `bridge.js`: runs in the ISOLATED world, reads the settings from `chrome.storage` and passes them to `content.js`, which can't reach `chrome.storage` from the MAIN world.
+- `background.js`: service worker for the daily update check and the toolbar badge.
+- `popup/`: the settings popup.
 - `styles.css`: minimal CSS with light and dark mode support.
 
 ## Known limitations
@@ -64,14 +77,14 @@ Facebook can change GraphQL `doc_id` values or query schemas at any time. If tha
 
 ## Debug mode
 
-Set `window.__FBSR_DEBUG = true` near the top of `content.js` and reload the extension. That enables:
+Turn on **Debug logging** in the popup and reload Facebook. That enables:
 
 - Console logging prefixed with `[FBSR]`.
 - A capture of up to 50 recent GraphQL response bodies in `window.__feedBodies`.
 
-The extension reads the flag when it loads, so setting it from the console has no effect. Keep it `false` in releases. The release workflow stops with an error if it's `true`.
+The extension reads the setting when the page loads, so setting `window.__FBSR_DEBUG` from the console has no effect. You can also set `window.__FBSR_DEBUG = true` near the top of `content.js` and reload the extension. Keep that line `false` in releases. The release workflow stops with an error if it's `true`.
 
-Set `window.__FBSR_DISABLE_SEEDING = true` to skip inline-script seeding when isolating a bug.
+Turn on **Skip inline-script seeding** to stop the extension from reading Facebook's server-rendered posts when you isolate a bug.
 
 ## Releasing
 
