@@ -4,6 +4,7 @@
 
 const DEFAULTS = {
   enabled: true,
+  hoverPreview: true,
   updateCheck: true,
   debug: false,
   disableSeeding: false,
@@ -69,7 +70,7 @@ function renderUpdate(update) {
 
 // Settings content.js reads at page load. updateCheck lives in the service
 // worker and applies at once.
-const PAGE_KEYS = ['enabled', 'debug', 'disableSeeding'];
+const PAGE_KEYS = ['enabled', 'hoverPreview', 'debug', 'disableSeeding'];
 
 // Shows the reload notice only when a Facebook tab is open and its settings
 // differ from the saved ones. bridge.js stores what the last page load got as
@@ -82,8 +83,39 @@ async function refreshNotice() {
   document.getElementById('reload-notice').hidden = tabs.length === 0;
 }
 
+function renderLogStatus(logs) {
+  const n = logs.reduce((sum, l) => sum + l.count, 0);
+  document.getElementById('log-status').textContent = n === 0
+    ? 'No warnings or errors recorded.'
+    : `${n} recent ${n === 1 ? 'warning or error' : 'warnings and errors'}.`;
+}
+
+// Plain text for a GitHub issue. Holds no tokens, user ids or post content:
+// bridge.js only stores the extension's own warning and error messages.
+async function buildDebugInfo() {
+  const s = await chrome.storage.local.get({ ...DEFAULTS, update: null, logs: [] });
+  const lines = [
+    `Return Facebook Share Viewer ${current}`,
+    `Browser: ${navigator.userAgent}`,
+    `Settings: ${Object.keys(DEFAULTS).map((k) => `${k}=${s[k] ? 'on' : 'off'}`).join(', ')}`,
+  ];
+  if (s.update && s.update.checkedAt) {
+    const when = new Date(s.update.checkedAt).toISOString();
+    lines.push(`Latest release: ${s.update.latest || 'unknown'} (checked ${when}${s.update.error ? `, last check failed: ${s.update.error}` : ''})`);
+  }
+  lines.push('', s.logs.length ? 'Recent warnings and errors:' : 'No warnings or errors recorded.');
+  for (const l of s.logs) {
+    const repeat = l.count > 1 ? ` (x${l.count})` : '';
+    lines.push(`${new Date(l.time).toISOString()} ${l.level}${repeat}: ${l.message}`);
+  }
+  return lines.join('\n');
+}
+
 async function init() {
-  const stored = await chrome.storage.local.get({ ...DEFAULTS, update: null });
+  const stored = await chrome.storage.local.get({ ...DEFAULTS, update: null, logs: [] });
+  // Open the debug panel when a debug switch is on, so it isn't on unseen.
+  document.getElementById('debug-panel').open = stored.debug || stored.disableSeeding;
+  renderLogStatus(stored.logs);
   for (const input of document.querySelectorAll('input[data-key]')) {
     input.checked = stored[input.dataset.key];
     input.addEventListener('change', async () => {
@@ -101,9 +133,26 @@ async function init() {
   await refreshNotice();
 }
 
-// Reloaded tabs write `applied`, which can hide the notice while the popup is open.
+// Reloaded tabs write `applied`, which can hide the notice while the popup is
+// open. Open tabs keep adding to `logs`.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && 'applied' in changes) refreshNotice();
+  if (area !== 'local') return;
+  if ('applied' in changes) refreshNotice();
+  if ('logs' in changes) renderLogStatus(changes.logs.newValue || []);
+});
+
+const copyBtn = document.getElementById('copy-debug');
+copyBtn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(await buildDebugInfo());
+    copyBtn.textContent = 'Copied';
+    showError('');
+  } catch (e) {
+    copyBtn.textContent = 'Copy debug info';
+    showError(`Couldn't copy: ${e.message}`);
+    return;
+  }
+  setTimeout(() => { copyBtn.textContent = 'Copy debug info'; }, 2000);
 });
 
 checkBtn.addEventListener('click', async () => {

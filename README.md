@@ -27,8 +27,11 @@ Scroll through your Facebook feed. Each post with at least one share gets an `N 
 Click the extension's toolbar icon to open its settings:
 
 - **Show share links on Facebook**: turn the extension off without removing it.
+- **Preview sharers on hover**: turn off the hover list to save one API call per hovered link. Clicking the link still opens the full list.
 - **Check now** and **Check GitHub once a day**: look for a newer release. A newer version shows a link to its release page.
-- **Debug logging** and **Skip inline-script seeding**: see [Debug mode](#debug-mode).
+- **Debugging** (folded by default):
+  - **Copy debug info** copies the extension and browser versions, your settings and the last 20 warnings and errors. Paste it into a GitHub issue when you report a bug. It holds no tokens, user ids or post content.
+  - **Debug logging** and **Skip inline-script seeding**: see [Debug mode](#debug-mode).
 
 Facebook tabs read the settings when they load. After you change one, click **Reload Facebook tabs** in the popup, or reload them yourself.
 

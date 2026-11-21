@@ -22,6 +22,7 @@ window.__fbsrSettingsReady = new Promise((resolve) => {
     window.__FBSR_OFF = !s.enabled;
     if (s.debug) window.__FBSR_DEBUG = true;
     if (s.disableSeeding) window.__FBSR_DISABLE_SEEDING = true;
+    window.__FBSR_NO_PREVIEW = s.hoverPreview === false;
     resolve();
   });
   // Without a reply (bridge.js missing, or orphaned after the extension
@@ -259,8 +260,14 @@ document.dispatchEvent(new CustomEvent('fbsr:settings-request'));
 function fbsrMain() {
   // Reads the flag on each call so setting it from the console works mid-session
   const log = (...a) => { if (window.__FBSR_DEBUG) console.log('[FBSR]', ...a); };
-  const warn = (...a) => { if (window.__FBSR_DEBUG) console.warn('[FBSR]', ...a); };
-  const err = (...a) => { console.error('[FBSR]', ...a); };
+  // Warnings and errors also go to bridge.js, which keeps the last few for the
+  // popup's "Copy debug info" button, with or without debug mode.
+  const report = (level, a) => {
+    const message = a.map((x) => (x instanceof Error ? x.message : String(x))).join(' ');
+    document.dispatchEvent(new CustomEvent('fbsr:log', { detail: JSON.stringify({ level, message }) }));
+  };
+  const warn = (...a) => { report('warn', a); if (window.__FBSR_DEBUG) console.warn('[FBSR]', ...a); };
+  const err = (...a) => { report('error', a); console.error('[FBSR]', ...a); };
 
   // ── Tokens ──────────────────────────────────────────────────────────────────
   let tokens = null;
@@ -907,6 +914,7 @@ function fbsrMain() {
 
     // Cancel pending show if user clicks something before mouseenter resolves
     link.addEventListener('mouseenter', () => {
+      if (window.__FBSR_NO_PREVIEW) return;
       const cancelOnClick = () => { document.removeEventListener('click', cancelOnClick, true); };
       document.addEventListener('click', cancelOnClick, true);
       showTooltip();

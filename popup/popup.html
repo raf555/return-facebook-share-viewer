@@ -24,9 +24,16 @@
       <label class="row">
         <span class="text">
           <span class="name">Show share links on Facebook</span>
-          <span class="desc">Off stops the extension from reading Facebook's responses or adding links.</span>
+          <span class="desc">Off stops reading responses and adding links.</span>
         </span>
         <input type="checkbox" role="switch" data-key="enabled">
+      </label>
+      <label class="row">
+        <span class="text">
+          <span class="name">Preview sharers on hover</span>
+          <span class="desc">Off skips the hover list and its API call. Click still works.</span>
+        </span>
+        <input type="checkbox" role="switch" data-key="hoverPreview">
       </label>
     </section>
 
@@ -39,29 +46,33 @@
       <label class="row">
         <span class="text">
           <span class="name">Check GitHub once a day</span>
-          <span class="desc">Shows UPD on the toolbar icon when a release is out. You still install it by hand.</span>
+          <span class="desc">Shows UPD on the toolbar icon when a release is out.</span>
         </span>
         <input type="checkbox" role="switch" data-key="updateCheck">
       </label>
     </section>
 
-    <section aria-labelledby="h-debug">
-      <h2 id="h-debug">Debugging</h2>
+    <details class="debug" id="debug-panel">
+      <summary><h2>Debugging</h2></summary>
+      <div class="update">
+        <p id="log-status" aria-live="polite">Loading…</p>
+        <button type="button" id="copy-debug">Copy debug info</button>
+      </div>
       <label class="row">
         <span class="text">
           <span class="name">Debug logging</span>
-          <span class="desc">Logs <code>[FBSR]</code> lines to the page console and keeps the last 50 GraphQL responses in <code>window.__feedBodies</code>.</span>
+          <span class="desc">Console logs, plus responses in <code>window.__feedBodies</code>.</span>
         </span>
         <input type="checkbox" role="switch" data-key="debug">
       </label>
       <label class="row">
         <span class="text">
           <span class="name">Skip inline-script seeding</span>
-          <span class="desc">Ignores the posts Facebook renders into the first page load. Use it to isolate a bug.</span>
+          <span class="desc">Ignores posts rendered into the first page load.</span>
         </span>
         <input type="checkbox" role="switch" data-key="disableSeeding">
       </label>
-    </section>
+    </details>
   </main>
 
   <footer class="notice" id="reload-notice" hidden>
